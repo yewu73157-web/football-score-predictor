@@ -59,7 +59,7 @@
       <section class="dashboard" id="dashboard" hidden>
         <div class="summary">
           <div>
-            <p class="label">最可能比分</p>
+            <p class="label">主推比分</p>
             <strong id="bestScore">-</strong>
           </div>
           <div>
@@ -67,7 +67,7 @@
             <strong id="lambdaText">-</strong>
           </div>
           <div>
-            <p class="label">数据质量</p>
+            <p class="label">模型信心</p>
             <strong id="qualityText">-</strong>
           </div>
         </div>
@@ -78,8 +78,20 @@
             <div id="outcomes" class="bars"></div>
           </article>
           <article class="panel">
-            <h2>热门比分</h2>
+            <h2>主推 5 个比分</h2>
             <div id="topScores" class="score-list"></div>
+          </article>
+        </div>
+
+        <div class="grid two">
+          <article class="panel">
+            <h2>候选比分池 Top 10</h2>
+            <div id="candidateScores" class="score-list compact"></div>
+          </article>
+          <article class="panel">
+            <h2>冷门保护</h2>
+            <div id="upsetScores" class="score-list compact"></div>
+            <p id="confidenceNote" class="copy small-copy"></p>
           </article>
         </div>
 
@@ -98,8 +110,8 @@
           <article class="panel">
             <h2>模型说明</h2>
             <p class="copy">
-              本工具只覆盖 2026 世界杯 32 强淘汰赛球队，预测口径为90分钟常规时间。模型先用国家队基础强度、本届赛事状态、东道主因素和联网搜索信号估计双方预期进球，再用泊松比分分布和 Dixon-Coles 低比分修正生成概率。
-              结果适合做概率参考，不应当当作确定结论。
+              本工具只覆盖 2026 世界杯 32 强淘汰赛球队，预测口径为90分钟常规时间。主推5个比分采用“概率 + 覆盖率”策略，覆盖平局、小胜、扩大比分和冷门路线。
+              它不能保证百分百命中，只用于提高真实比分落入推荐池的概率。
             </p>
           </article>
         </div>

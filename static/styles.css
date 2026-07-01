@@ -273,7 +273,25 @@ h2 {
 }
 
 .score-item strong {
+  display: block;
   font-size: 19px;
+}
+
+.score-item em {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+  font-style: normal;
+}
+
+.compact .score-item {
+  min-height: 36px;
+  padding: 8px 10px;
+}
+
+.compact .score-item strong {
+  font-size: 17px;
 }
 
 .matrix-wrap {
@@ -329,6 +347,11 @@ td {
   margin: 0;
   color: var(--muted);
   line-height: 1.75;
+}
+
+.small-copy {
+  margin-top: 12px;
+  font-size: 13px;
 }
 
 .backtest-summary {

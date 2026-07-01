@@ -240,6 +240,94 @@ def build_score_matrix(home_lam: float, away_lam: float) -> list[list[float]]:
     return [[value / total for value in row] for row in matrix]
 
 
+def score_item(home_goals: int, away_goals: int, probability: float, label: str = "") -> dict[str, Any]:
+    return {
+        "score": f"{home_goals}-{away_goals}",
+        "home": home_goals,
+        "away": away_goals,
+        "prob": probability,
+        "label": label,
+    }
+
+
+def find_best_score(
+    all_scores: list[dict[str, Any]],
+    predicate,
+    used: set[str],
+    label: str,
+) -> dict[str, Any] | None:
+    for item in all_scores:
+        if item["score"] not in used and predicate(item):
+            candidate = dict(item)
+            candidate["label"] = label
+            return candidate
+    return None
+
+
+def build_coverage_scores(
+    all_scores: list[dict[str, Any]],
+    home_win: float,
+    draw: float,
+    away_win: float,
+) -> dict[str, Any]:
+    used: set[str] = set()
+    recommendations: list[dict[str, Any]] = []
+    sorted_scores = sorted(all_scores, key=lambda item: item["prob"], reverse=True)
+    favorite = "home" if home_win >= away_win else "away"
+    favorite_margin = abs(home_win - away_win)
+
+    def add(candidate: dict[str, Any] | None) -> None:
+        if candidate and candidate["score"] not in used and len(recommendations) < 5:
+            used.add(candidate["score"])
+            recommendations.append(candidate)
+
+    add(dict(sorted_scores[0], label="概率最高"))
+    add(find_best_score(sorted_scores, lambda item: item["home"] == item["away"], used, "平局保护"))
+    if favorite == "home":
+        add(find_best_score(sorted_scores, lambda item: item["home"] > item["away"] and item["home"] - item["away"] == 1, used, "主队小胜"))
+        add(find_best_score(sorted_scores, lambda item: item["home"] > item["away"] and item["home"] >= 2, used, "主队扩大比分"))
+        if max(home_win, away_win) >= 0.50 or favorite_margin >= 0.18:
+            add(find_best_score(sorted_scores, lambda item: item["home"] >= 3 and item["home"] - item["away"] >= 2, used, "强队大胜保护"))
+        add(find_best_score(sorted_scores, lambda item: item["away"] > item["home"], used, "冷门保护"))
+    else:
+        add(find_best_score(sorted_scores, lambda item: item["away"] > item["home"] and item["away"] - item["home"] == 1, used, "客队小胜"))
+        add(find_best_score(sorted_scores, lambda item: item["away"] > item["home"] and item["away"] >= 2, used, "客队扩大比分"))
+        if max(home_win, away_win) >= 0.50 or favorite_margin >= 0.18:
+            add(find_best_score(sorted_scores, lambda item: item["away"] >= 3 and item["away"] - item["home"] >= 2, used, "强队大胜保护"))
+        add(find_best_score(sorted_scores, lambda item: item["home"] > item["away"], used, "冷门保护"))
+
+    add(find_best_score(sorted_scores, lambda item: item["home"] + item["away"] >= 3, used, "进攻战保护"))
+    for item in sorted_scores:
+        add(dict(item, label="概率补位"))
+
+    top10_pool = sorted_scores[:10]
+    upset_scores = [
+        dict(item, label="冷门保护")
+        for item in sorted_scores
+        if (item["away"] > item["home"] if favorite == "home" else item["home"] > item["away"])
+    ][:3]
+    top5_mass = sum(item["prob"] for item in recommendations)
+    favorite_prob = max(home_win, away_win)
+    if favorite_prob >= 0.52 and favorite_margin >= 0.18:
+        confidence = "高"
+        confidence_note = "优势方较明确，但比分仍不能保证。"
+    elif favorite_prob >= 0.42 or draw >= 0.30:
+        confidence = "中"
+        confidence_note = "有倾向，但平局或一球差结果占比较高。"
+    else:
+        confidence = "低"
+        confidence_note = "胜平负接近，杯赛波动较大。"
+
+    return {
+        "recommendedTop5": recommendations,
+        "candidateTop10": top10_pool,
+        "upsetProtection": upset_scores,
+        "top5ProbabilityMass": top5_mass,
+        "confidence": confidence,
+        "confidenceNote": confidence_note,
+    }
+
+
 def predict(home: str, away: str, neutral: bool) -> dict[str, Any]:
     home_profile = resolve_team(home)
     away_profile = resolve_team(away)
@@ -296,8 +384,9 @@ def predict(home: str, away: str, neutral: bool) -> dict[str, Any]:
                 over25 += p
             if h > 0 and a > 0:
                 btts += p
-            top_scores.append({"score": f"{h}-{a}", "home": h, "away": a, "prob": p})
+            top_scores.append(score_item(h, a, p))
     top_scores.sort(key=lambda item: item["prob"], reverse=True)
+    coverage = build_coverage_scores(top_scores, home_win, draw, away_win)
 
     data_points = 2
     data_points += 1 if home_news.get("ok") else 0
@@ -318,6 +407,7 @@ def predict(home: str, away: str, neutral: bool) -> dict[str, Any]:
             "btts": btts,
         },
         "topScores": top_scores[:10],
+        "coverageScores": coverage,
         "matrix": matrix,
         "dataQuality": {
             "score": round(data_points / 4 * 100),

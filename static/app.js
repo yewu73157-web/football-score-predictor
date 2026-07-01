@@ -6,6 +6,9 @@ const lambdaText = document.querySelector("#lambdaText");
 const qualityText = document.querySelector("#qualityText");
 const outcomes = document.querySelector("#outcomes");
 const topScores = document.querySelector("#topScores");
+const candidateScores = document.querySelector("#candidateScores");
+const upsetScores = document.querySelector("#upsetScores");
+const confidenceNote = document.querySelector("#confidenceNote");
 const matrixEl = document.querySelector("#matrix");
 const sourceSummary = document.querySelector("#sourceSummary");
 const backtestSummary = document.querySelector("#backtestSummary");
@@ -44,11 +47,30 @@ function renderTopScores(scores) {
   topScores.innerHTML = scores
     .map((item) => `
       <div class="score-item">
-        <strong>${item.score}</strong>
+        <div>
+          <strong>${item.score}</strong>
+          <em>${item.label || "推荐"}</em>
+        </div>
         <span>${pct(item.prob)}</span>
       </div>
     `)
     .join("");
+}
+
+function renderScoreList(target, scores) {
+  target.innerHTML = scores.length
+    ? scores
+        .map((item) => `
+          <div class="score-item">
+            <div>
+              <strong>${item.score}</strong>
+              <em>${item.label || "候选"}</em>
+            </div>
+            <span>${pct(item.prob)}</span>
+          </div>
+        `)
+        .join("")
+    : '<p class="copy">暂无可用比分。</p>';
 }
 
 function renderMatrix(matrix) {
@@ -165,11 +187,14 @@ async function runPrediction(event) {
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "请求失败");
 
-    bestScore.textContent = `${data.topScores[0].score}（${pct(data.topScores[0].prob)}）`;
+    bestScore.textContent = `${data.coverageScores.recommendedTop5[0].score}（5选覆盖）`;
     lambdaText.textContent = `${data.homeLambda.toFixed(2)} : ${data.awayLambda.toFixed(2)}`;
-    qualityText.textContent = `${data.dataQuality.level}（${data.dataQuality.score}）`;
+    qualityText.textContent = `${data.coverageScores.confidence}（覆盖${pct(data.coverageScores.top5ProbabilityMass)}）`;
     renderBars(data.probabilities, home, away);
-    renderTopScores(data.topScores);
+    renderTopScores(data.coverageScores.recommendedTop5);
+    renderScoreList(candidateScores, data.coverageScores.candidateTop10);
+    renderScoreList(upsetScores, data.coverageScores.upsetProtection);
+    confidenceNote.textContent = data.coverageScores.confidenceNote;
     renderMatrix(data.matrix);
     renderSources(data);
     dashboard.hidden = false;

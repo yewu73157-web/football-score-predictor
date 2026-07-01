@@ -285,12 +285,14 @@ def build_coverage_scores(
     add(find_best_score(sorted_scores, lambda item: item["home"] == item["away"], used, "平局保护"))
     if favorite == "home":
         add(find_best_score(sorted_scores, lambda item: item["home"] > item["away"] and item["home"] - item["away"] == 1, used, "主队小胜"))
+        add(find_best_score(sorted_scores, lambda item: item["home"] >= 2 and item["away"] == 0, used, "主队零封保护"))
         add(find_best_score(sorted_scores, lambda item: item["home"] > item["away"] and item["home"] >= 2, used, "主队扩大比分"))
         if max(home_win, away_win) >= 0.50 or favorite_margin >= 0.18:
             add(find_best_score(sorted_scores, lambda item: item["home"] >= 3 and item["home"] - item["away"] >= 2, used, "强队大胜保护"))
         add(find_best_score(sorted_scores, lambda item: item["away"] > item["home"], used, "冷门保护"))
     else:
         add(find_best_score(sorted_scores, lambda item: item["away"] > item["home"] and item["away"] - item["home"] == 1, used, "客队小胜"))
+        add(find_best_score(sorted_scores, lambda item: item["away"] >= 2 and item["home"] == 0, used, "客队零封保护"))
         add(find_best_score(sorted_scores, lambda item: item["away"] > item["home"] and item["away"] >= 2, used, "客队扩大比分"))
         if max(home_win, away_win) >= 0.50 or favorite_margin >= 0.18:
             add(find_best_score(sorted_scores, lambda item: item["away"] >= 3 and item["away"] - item["home"] >= 2, used, "强队大胜保护"))

@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>足球杯比分预测模型</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <div class="hero__content">
+          <p class="eyebrow">2026 世界杯淘汰赛 · 国家队强度 · 阵容风险 · Dixon-Coles</p>
+          <h1>足球杯比分预测模型</h1>
+          <form id="predictForm" class="predict-form">
+            <label>
+              <span>主队 / 球队 A</span>
+              <select id="homeTeam" name="home">
+                {% for team in teams %}
+                  <option value="{{ team.zh }}" {% if team.zh == "法国" %}selected{% endif %}>{{ team.zh }} · {{ team.status }}</option>
+                {% endfor %}
+              </select>
+            </label>
+            <label>
+              <span>客队 / 球队 B</span>
+              <select id="awayTeam" name="away">
+                {% for team in teams %}
+                  <option value="{{ team.zh }}" {% if team.zh == "巴拉圭" %}selected{% endif %}>{{ team.zh }} · {{ team.status }}</option>
+                {% endfor %}
+              </select>
+            </label>
+            <label class="switch">
+              <input id="neutral" type="checkbox" checked />
+              <span>中立场</span>
+            </label>
+            <button type="submit">
+              <span class="icon">⌕</span>
+              开始预测
+            </button>
+          </form>
+        </div>
+      </section>
+
+      <section class="status" id="status">选择本届世界杯32强淘汰赛球队，系统会联网搜索近况、伤停和阵容信息并生成比分概率。</section>
+
+      <section class="dashboard">
+        <article class="panel">
+          <div class="panel-title">
+            <h2>已赛回测</h2>
+            <button id="refreshBacktest" class="ghost-button" type="button">刷新</button>
+          </div>
+          <div id="backtestSummary" class="backtest-summary">正在计算已结束淘汰赛回测...</div>
+          <div class="matrix-wrap">
+            <table id="backtestTable" class="backtest-table"></table>
+          </div>
+        </article>
+      </section>
+
+      <section class="dashboard" id="dashboard" hidden>
+        <div class="summary">
+          <div>
+            <p class="label">最可能比分</p>
+            <strong id="bestScore">-</strong>
+          </div>
+          <div>
+            <p class="label">预期进球</p>
+            <strong id="lambdaText">-</strong>
+          </div>
+          <div>
+            <p class="label">数据质量</p>
+            <strong id="qualityText">-</strong>
+          </div>
+        </div>
+
+        <div class="grid two">
+          <article class="panel">
+            <h2>赛果概率</h2>
+            <div id="outcomes" class="bars"></div>
+          </article>
+          <article class="panel">
+            <h2>热门比分</h2>
+            <div id="topScores" class="score-list"></div>
+          </article>
+        </div>
+
+        <article class="panel">
+          <h2>比分概率热力表</h2>
+          <div class="matrix-wrap">
+            <table id="matrix"></table>
+          </div>
+        </article>
+
+        <div class="grid two">
+          <article class="panel">
+            <h2>联网分析摘要</h2>
+            <div id="sourceSummary" class="source-summary"></div>
+          </article>
+          <article class="panel">
+            <h2>模型说明</h2>
+            <p class="copy">
+              本工具只覆盖 2026 世界杯 32 强淘汰赛球队，预测口径为90分钟常规时间。模型先用国家队基础强度、本届赛事状态、东道主因素和联网搜索信号估计双方预期进球，再用泊松比分分布和 Dixon-Coles 低比分修正生成概率。
+              结果适合做概率参考，不应当当作确定结论。
+            </p>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>

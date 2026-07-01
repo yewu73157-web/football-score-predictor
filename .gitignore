@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.log
+tools/
+current-public-url.txt
+.env

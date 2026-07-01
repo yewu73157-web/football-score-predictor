@@ -107,6 +107,7 @@ function renderSources(data) {
     <div class="source-card">
       <strong>模型因子</strong>
       <p>使用国家队基础强度、本届赛事状态、东道主优势、淘汰赛保守系数、是否同洲际对手、联网搜索中的近况和伤停关键词来修正预期进球。</p>
+      <p>搜索质量：${pct(data.dataQuality.searchQuality || 0)}。${data.dataQuality.searchNote || ""}</p>
     </div>
     <div class="source-card">
       <strong>伤停与阵容搜索</strong>
@@ -124,7 +125,8 @@ function renderBacktest(data) {
   backtestSummary.innerHTML = `
     <div class="metric"><span>胜平负方向</span><strong>${pct(data.resultAccuracy)}</strong></div>
     <div class="metric"><span>最可能比分命中</span><strong>${pct(data.exactAccuracy)}</strong></div>
-    <div class="metric"><span>实际比分进前5</span><strong>${pct(data.top5Accuracy)}</strong></div>
+    <div class="metric"><span>概率前5覆盖</span><strong>${pct(data.top5Accuracy)}</strong></div>
+    <div class="metric"><span>主推5个覆盖</span><strong>${pct(data.recommendedTop5Accuracy)}</strong></div>
   `;
   let html = `
     <thead>
@@ -133,6 +135,7 @@ function renderBacktest(data) {
         <th>实际比分</th>
         <th>模型首选</th>
         <th>实际排名</th>
+        <th>主推5覆盖</th>
         <th>方向</th>
       </tr>
     </thead>
@@ -145,6 +148,7 @@ function renderBacktest(data) {
         <td>${row.actualScore}</td>
         <td>${row.topScore}（${pct(row.topScoreProb)}）</td>
         <td>第 ${row.actualScoreRank}（${pct(row.actualScoreProb)}）</td>
+        <td class="${row.recommendedHit ? "hit" : "miss"}">${row.recommendedHit ? "命中" : "未命中"}</td>
         <td class="${row.outcomeHit ? "hit" : "miss"}">${outcomeName(row.predictedOutcome)} / ${outcomeName(row.actualOutcome)}</td>
       </tr>
     `;

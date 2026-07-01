@@ -180,12 +180,19 @@ def search_web_signals(team: str) -> dict[str, Any]:
     snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', html, flags=re.S)
     items = []
     text_blob = ""
-    for title, snippet in list(zip(titles, snippets))[:5]:
+    team_tokens = [token for token in re.split(r"[\s-]+", search_name.lower()) if len(token) >= 4]
+    relevant_hits = 0
+    for title, snippet in list(zip(titles, snippets))[:6]:
         clean_title = re.sub("<.*?>", "", title)
         clean_snippet = re.sub("<.*?>", "", snippet)
         clean_title = re.sub(r"\s+", " ", clean_title).strip()
         clean_snippet = re.sub(r"\s+", " ", clean_snippet).strip()
-        text_blob += " " + clean_title + " " + clean_snippet
+        combined = f"{clean_title} {clean_snippet}"
+        lower_combined = combined.lower()
+        is_team_relevant = search_name.lower() in lower_combined or any(token in lower_combined for token in team_tokens)
+        if is_team_relevant:
+            relevant_hits += 1
+            text_blob += " " + combined
         items.append({"title": clean_title, "snippet": clean_snippet})
 
     negative_words = [
@@ -203,11 +210,22 @@ def search_web_signals(team: str) -> dict[str, Any]:
     positive_words = ["return", "available", "fit", "back", "复出", "可出场"]
     neg = sum(text_blob.lower().count(word) for word in negative_words)
     pos = sum(text_blob.lower().count(word) for word in positive_words)
-    risk = max(-0.08, min(0.12, (neg - pos) * 0.018))
+    signal_quality = min(1.0, relevant_hits / 3)
+    raw_risk = (neg - pos) * 0.015 * signal_quality
+    risk = max(-0.04, min(0.06, raw_risk))
     form_words = ["win", "beat", "advanced", "qualified", "unbeaten", "胜", "晋级", "不败"]
     weak_words = ["lost", "loss", "struggled", "eliminated", "defeat", "输", "出局", "低迷"]
-    form = max(-0.10, min(0.10, (sum(text_blob.lower().count(w) for w in form_words) - sum(text_blob.lower().count(w) for w in weak_words)) * 0.012))
-    return {"ok": True, "query": query, "items": items, "risk": risk, "form": form}
+    raw_form = (sum(text_blob.lower().count(w) for w in form_words) - sum(text_blob.lower().count(w) for w in weak_words)) * 0.01 * signal_quality
+    form = max(-0.05, min(0.05, raw_form))
+    return {
+        "ok": True,
+        "query": query,
+        "items": items,
+        "risk": risk,
+        "form": form,
+        "signalQuality": signal_quality,
+        "relevantHits": relevant_hits,
+    }
 
 
 def poisson(k: int, lam: float) -> float:
@@ -330,6 +348,13 @@ def build_coverage_scores(
     }
 
 
+def news_adjustment(news: dict[str, Any]) -> tuple[float, float]:
+    quality = news.get("signalQuality", 0.0) if news.get("ok") else 0.0
+    if quality < 0.34:
+        return 0.0, 0.0
+    return news.get("form", 0.0), news.get("risk", 0.0)
+
+
 def predict(home: str, away: str, neutral: bool) -> dict[str, Any]:
     home_profile = resolve_team(home)
     away_profile = resolve_team(away)
@@ -338,6 +363,8 @@ def predict(home: str, away: str, neutral: bool) -> dict[str, Any]:
         raise ValueError(f"只能选择本届世界杯32强淘汰赛球队。可选：{valid}")
     home_news = search_web_signals(home)
     away_news = search_web_signals(away)
+    home_news_form, home_news_risk = news_adjustment(home_news)
+    away_news_form, away_news_risk = news_adjustment(away_news)
 
     rating_gap = (home_profile.rating - away_profile.rating) / 400.0
     base_home = 1.36 if not neutral else 1.28
@@ -351,8 +378,8 @@ def predict(home: str, away: str, neutral: bool) -> dict[str, Any]:
         + home_profile.attack
         - away_profile.defense
         + home_profile.momentum
-        + home_news.get("form", 0)
-        - home_news["risk"]
+        + home_news_form
+        - home_news_risk
         + host_home
         + knockout_conservatism
         + same_confed_drag
@@ -362,8 +389,8 @@ def predict(home: str, away: str, neutral: bool) -> dict[str, Any]:
         + away_profile.attack
         - home_profile.defense
         + away_profile.momentum
-        + away_news.get("form", 0)
-        - away_news["risk"]
+        + away_news_form
+        - away_news_risk
         + host_away
         + knockout_conservatism
         + same_confed_drag
@@ -393,6 +420,7 @@ def predict(home: str, away: str, neutral: bool) -> dict[str, Any]:
     data_points = 2
     data_points += 1 if home_news.get("ok") else 0
     data_points += 1 if away_news.get("ok") else 0
+    search_quality = (home_news.get("signalQuality", 0.0) + away_news.get("signalQuality", 0.0)) / 2
 
     return {
         "homeInput": home_profile.zh,
@@ -415,6 +443,8 @@ def predict(home: str, away: str, neutral: bool) -> dict[str, Any]:
             "score": round(data_points / 4 * 100),
             "level": "高" if data_points >= 4 else "中",
             "note": "球队范围已限制为2026世界杯32强淘汰赛队伍；伤停/阵容来自搜索摘要，不等同于官方名单。",
+            "searchQuality": search_quality,
+            "searchNote": "搜索摘要命中球队名称时才会参与模型修正；泛化新闻会被降权。",
         },
         "sources": {
             "profiles": [home_profile.__dict__, away_profile.__dict__],
@@ -442,6 +472,7 @@ def evaluate_completed_matches() -> dict[str, Any]:
     result_hits = 0
     exact_hits = 0
     top5_hits = 0
+    recommended_hits = 0
     for match in COMPLETED_MATCHES:
         result = predict(match["home"], match["away"], match["neutral"])
         probs = result["probabilities"]
@@ -460,6 +491,9 @@ def evaluate_completed_matches() -> dict[str, Any]:
         actual_rank = next(i + 1 for i, (score, _) in enumerate(all_scores) if list(score) == match["score"])
         actual_prob = next(probability for score, probability in all_scores if list(score) == match["score"])
         top5_hits += actual_rank <= 5
+        recommended_scores = [item["score"] for item in result["coverageScores"]["recommendedTop5"]]
+        recommended_hit = f'{match["score"][0]}-{match["score"][1]}' in recommended_scores
+        recommended_hits += recommended_hit
         rows.append(
             {
                 "match": f'{match["home"]} vs {match["away"]}',
@@ -471,6 +505,8 @@ def evaluate_completed_matches() -> dict[str, Any]:
                 "predictedOutcome": predicted_outcome,
                 "actualOutcome": actual_outcome,
                 "outcomeHit": predicted_outcome == actual_outcome,
+                "recommendedScores": recommended_scores,
+                "recommendedHit": recommended_hit,
             }
         )
     total = len(COMPLETED_MATCHES)
@@ -479,6 +515,7 @@ def evaluate_completed_matches() -> dict[str, Any]:
         "resultAccuracy": result_hits / total,
         "exactAccuracy": exact_hits / total,
         "top5Accuracy": top5_hits / total,
+        "recommendedTop5Accuracy": recommended_hits / total,
         "rows": rows,
     }
 

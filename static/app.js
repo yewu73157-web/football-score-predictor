@@ -192,8 +192,12 @@ async function runPrediction(event) {
   button.disabled = true;
   dashboard.hidden = true;
   setStatus("正在联网搜索世界杯近况、伤停和预计阵容摘要...");
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 12000);
   try {
-    const response = await fetch(`/api/predict?home=${encodeURIComponent(home)}&away=${encodeURIComponent(away)}&neutral=${neutral}`);
+    const response = await fetch(`/api/predict?home=${encodeURIComponent(home)}&away=${encodeURIComponent(away)}&neutral=${neutral}`, {
+      signal: controller.signal,
+    });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "请求失败");
 
@@ -211,8 +215,10 @@ async function runPrediction(event) {
     dashboard.hidden = false;
     setStatus(`预测完成：${data.generatedAt}。${data.dataQuality.note}`);
   } catch (error) {
-    setStatus(error.message, true);
+    const message = error.name === "AbortError" ? "联网搜索超时，请稍后重试或刷新页面。" : error.message;
+    setStatus(message, true);
   } finally {
+    clearTimeout(timeoutId);
     button.disabled = false;
   }
 }

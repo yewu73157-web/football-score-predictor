@@ -15,7 +15,7 @@ from flask import Flask, jsonify, render_template, request
 
 
 app = Flask(__name__)
-APP_VERSION = "20260702-tiered-coverage1"
+APP_VERSION = "20260702-fast-backtest1"
 
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 football-score-predictor/1.0 (local analytics app)"
@@ -192,6 +192,19 @@ def http_get(url: str, timeout: int = 8) -> str:
     return response.text
 
 
+def offline_web_signals(team: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "query": "",
+        "items": [],
+        "risk": 0.0,
+        "form": 0.0,
+        "signalQuality": 0.0,
+        "relevantHits": 0,
+        "error": "回测使用离线模式，避免页面加载时等待外网搜索。",
+    }
+
+
 @lru_cache(maxsize=96)
 def search_web_signals(team: str) -> dict[str, Any]:
     profile = resolve_team(team)
@@ -199,7 +212,7 @@ def search_web_signals(team: str) -> dict[str, Any]:
     query = f"{search_name} World Cup 2026 injuries lineup recent form knockout"
     url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
     try:
-        html = http_get(url, timeout=10)
+        html = http_get(url, timeout=4)
     except Exception as exc:
         return {"ok": False, "query": query, "items": [], "risk": 0.0, "error": str(exc)}
 
@@ -480,14 +493,18 @@ def news_adjustment(news: dict[str, Any]) -> tuple[float, float]:
     return news.get("form", 0.0), news.get("risk", 0.0)
 
 
-def predict(home: str, away: str, neutral: bool) -> dict[str, Any]:
+def predict(home: str, away: str, neutral: bool, use_web: bool = True) -> dict[str, Any]:
     home_profile = resolve_team(home)
     away_profile = resolve_team(away)
     if not home_profile or not away_profile:
         valid = "、".join(team["zh"] for team in KNOCKOUT_TEAMS)
         raise ValueError(f"只能选择本届世界杯32强淘汰赛球队。可选：{valid}")
-    home_news = search_web_signals(home)
-    away_news = search_web_signals(away)
+    if use_web:
+        home_news = search_web_signals(home)
+        away_news = search_web_signals(away)
+    else:
+        home_news = offline_web_signals(home)
+        away_news = offline_web_signals(away)
     home_news_form, home_news_risk = news_adjustment(home_news)
     away_news_form, away_news_risk = news_adjustment(away_news)
 
@@ -567,7 +584,7 @@ def predict(home: str, away: str, neutral: bool) -> dict[str, Any]:
         "dataQuality": {
             "score": round(data_points / 4 * 100),
             "level": "高" if data_points >= 4 else "中",
-            "note": "球队范围已限制为2026世界杯32强淘汰赛队伍；伤停/阵容来自搜索摘要，不等同于官方名单。",
+            "note": "球队范围已限制为2026世界杯32强淘汰赛队伍；预测搜索只在单场预测时执行，回测使用离线模式以保证页面速度。",
             "searchQuality": search_quality,
             "searchNote": "搜索摘要命中球队名称时才会参与模型修正；泛化新闻会被降权。",
         },
@@ -602,7 +619,7 @@ def evaluate_completed_matches() -> dict[str, Any]:
     recommended5_hits = 0
     top10_hits = 0
     for match in COMPLETED_MATCHES:
-        result = predict(match["home"], match["away"], match["neutral"])
+        result = predict(match["home"], match["away"], match["neutral"], use_web=False)
         probs = result["probabilities"]
         pmap = {"H": probs["homeWin"], "D": probs["draw"], "A": probs["awayWin"]}
         predicted_outcome = max(pmap, key=pmap.get)

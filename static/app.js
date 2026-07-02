@@ -106,7 +106,7 @@ function renderSources(data) {
     </div>
     <div class="source-card">
       <strong>模型因子</strong>
-      <p>使用国家队基础强度、本届赛事状态、东道主优势、淘汰赛保守系数、是否同洲际对手、联网搜索中的近况和伤停关键词来修正预期进球。</p>
+      <p>使用国家队基础强度、本届赛事状态、东道主优势、淘汰赛保守系数、历史淘汰赛比分先验、是否同洲际对手、联网搜索中的近况和伤停关键词来修正预期进球。</p>
       <p>搜索质量：${pct(data.dataQuality.searchQuality || 0)}。${data.dataQuality.searchNote || ""}</p>
     </div>
     <div class="source-card">
@@ -126,7 +126,7 @@ function renderBacktest(data) {
     <div class="metric"><span>胜平负方向</span><strong>${pct(data.resultAccuracy)}</strong></div>
     <div class="metric"><span>最可能比分命中</span><strong>${pct(data.exactAccuracy)}</strong></div>
     <div class="metric"><span>概率前5覆盖</span><strong>${pct(data.top5Accuracy)}</strong></div>
-    <div class="metric"><span>主推5个覆盖</span><strong>${pct(data.recommendedTop5Accuracy)}</strong></div>
+    <div class="metric"><span>主推3个覆盖</span><strong>${pct(data.recommendedTop3Accuracy)}</strong></div>
   `;
   let html = `
     <thead>
@@ -135,7 +135,7 @@ function renderBacktest(data) {
         <th>实际比分</th>
         <th>模型首选</th>
         <th>实际排名</th>
-        <th>主推5覆盖</th>
+        <th>主推3覆盖</th>
         <th>方向</th>
       </tr>
     </thead>
@@ -191,11 +191,11 @@ async function runPrediction(event) {
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "请求失败");
 
-    bestScore.textContent = `${data.coverageScores.recommendedTop5[0].score}（5选覆盖）`;
+    bestScore.textContent = `${data.coverageScores.recommendedTop3[0].score}（3选覆盖）`;
     lambdaText.textContent = `${data.homeLambda.toFixed(2)} : ${data.awayLambda.toFixed(2)}`;
-    qualityText.textContent = `${data.coverageScores.confidence}（覆盖${pct(data.coverageScores.top5ProbabilityMass)}）`;
+    qualityText.textContent = `${data.coverageScores.confidence}（覆盖${pct(data.coverageScores.top3ProbabilityMass)}）`;
     renderBars(data.probabilities, home, away);
-    renderTopScores(data.coverageScores.recommendedTop5);
+    renderTopScores(data.coverageScores.recommendedTop3);
     renderScoreList(candidateScores, data.coverageScores.candidateTop10);
     renderScoreList(upsetScores, data.coverageScores.upsetProtection);
     confidenceNote.textContent = data.coverageScores.confidenceNote;

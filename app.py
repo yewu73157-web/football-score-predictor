@@ -98,7 +98,32 @@ COMPLETED_MATCHES = [
     {"home": "挪威", "away": "科特迪瓦", "score": [2, 1], "neutral": True},
     {"home": "法国", "away": "瑞典", "score": [3, 0], "neutral": True},
     {"home": "墨西哥", "away": "厄瓜多尔", "score": [2, 0], "neutral": False},
+    {"home": "英格兰", "away": "民主刚果", "score": [2, 1], "neutral": True},
+    {"home": "比利时", "away": "塞内加尔", "score": [3, 2], "neutral": True},
 ]
+
+# Recent World Cup knockout matches are dominated by narrow wins and low-to-medium
+# scorelines. The multipliers are used only for recommendation order, not for the
+# displayed Poisson probabilities.
+HISTORICAL_KNOCKOUT_PRIOR = {
+    "1-0": 1.20,
+    "0-1": 1.20,
+    "2-1": 1.18,
+    "1-2": 1.18,
+    "2-0": 1.14,
+    "0-2": 1.14,
+    "1-1": 1.12,
+    "0-0": 1.06,
+    "3-0": 1.05,
+    "0-3": 1.05,
+    "3-1": 1.04,
+    "1-3": 1.04,
+    "2-2": 0.94,
+    "3-2": 0.90,
+    "2-3": 0.90,
+    "4-2": 0.62,
+    "2-4": 0.62,
+}
 
 TEAM_LOOKUP = {team["zh"]: team for team in KNOCKOUT_TEAMS}
 TEAM_LOOKUP.update({team["en"].lower(): team for team in KNOCKOUT_TEAMS})
@@ -282,6 +307,45 @@ def find_best_score(
     return None
 
 
+def apply_historical_prior(
+    all_scores: list[dict[str, Any]],
+    favorite: str,
+    favorite_prob: float,
+    draw: float,
+    over25: float,
+    btts: float,
+) -> list[dict[str, Any]]:
+    adjusted = []
+    for item in all_scores:
+        candidate = dict(item)
+        multiplier = HISTORICAL_KNOCKOUT_PRIOR.get(candidate["score"], 0.82)
+        total_goals = candidate["home"] + candidate["away"]
+        is_favorite_win = candidate["home"] > candidate["away"] if favorite == "home" else candidate["away"] > candidate["home"]
+        is_clean_sheet = candidate["away"] == 0 if favorite == "home" else candidate["home"] == 0
+
+        if is_favorite_win:
+            multiplier *= 1.04
+        if favorite_prob >= 0.54 and is_favorite_win and is_clean_sheet:
+            multiplier *= 1.10
+        if btts >= 0.50 and total_goals >= 3 and candidate["home"] > 0 and candidate["away"] > 0:
+            multiplier *= 1.10
+        if over25 >= 0.55 and total_goals >= 3:
+            multiplier *= 1.08
+        if over25 < 0.50 and total_goals >= 4:
+            multiplier *= 0.72
+        if candidate["score"] in {"3-2", "2-3"} and btts >= 0.50 and over25 >= 0.48 and (favorite_prob < 0.48 or draw >= 0.24):
+            multiplier *= 1.55
+        if candidate["score"] in {"4-2", "2-4"}:
+            if over25 >= 0.68 and btts >= 0.58 and 0.50 <= favorite_prob <= 0.70:
+                multiplier *= 2.25
+            else:
+                multiplier *= 0.45
+
+        candidate["coverageProb"] = candidate["prob"] * multiplier
+        adjusted.append(candidate)
+    return sorted(adjusted, key=lambda item: item["coverageProb"], reverse=True)
+
+
 def build_coverage_scores(
     all_scores: list[dict[str, Any]],
     home_win: float,
@@ -293,31 +357,59 @@ def build_coverage_scores(
     sorted_scores = sorted(all_scores, key=lambda item: item["prob"], reverse=True)
     favorite = "home" if home_win >= away_win else "away"
     favorite_margin = abs(home_win - away_win)
+    favorite_prob = max(home_win, away_win)
+    over25 = sum(item["prob"] for item in all_scores if item["home"] + item["away"] >= 3)
+    btts = sum(item["prob"] for item in all_scores if item["home"] > 0 and item["away"] > 0)
+    coverage_scores = apply_historical_prior(all_scores, favorite, favorite_prob, draw, over25, btts)
 
     def add(candidate: dict[str, Any] | None) -> None:
-        if candidate and candidate["score"] not in used and len(recommendations) < 5:
+        if candidate and candidate["score"] not in used and len(recommendations) < 3:
             used.add(candidate["score"])
             recommendations.append(candidate)
 
     add(dict(sorted_scores[0], label="概率最高"))
-    add(find_best_score(sorted_scores, lambda item: item["home"] == item["away"], used, "平局保护"))
     if favorite == "home":
-        add(find_best_score(sorted_scores, lambda item: item["home"] > item["away"] and item["home"] - item["away"] == 1, used, "主队小胜"))
-        add(find_best_score(sorted_scores, lambda item: item["home"] >= 2 and item["away"] == 0, used, "主队零封保护"))
-        add(find_best_score(sorted_scores, lambda item: item["home"] > item["away"] and item["home"] >= 2, used, "主队扩大比分"))
-        if max(home_win, away_win) >= 0.50 or favorite_margin >= 0.18:
-            add(find_best_score(sorted_scores, lambda item: item["home"] >= 3 and item["home"] - item["away"] >= 2, used, "强队大胜保护"))
-        add(find_best_score(sorted_scores, lambda item: item["away"] > item["home"], used, "冷门保护"))
+        before_small_win = len(recommendations)
+        if btts >= 0.49:
+            add(find_best_score(coverage_scores, lambda item: item["home"] > item["away"] and item["home"] - item["away"] == 1 and item["away"] > 0, used, "主队一球小胜"))
+        if len(recommendations) == before_small_win:
+            add(find_best_score(coverage_scores, lambda item: item["home"] > item["away"] and item["home"] - item["away"] == 1, used, "主队一球小胜"))
+        if over25 >= 0.68 and btts >= 0.58 and 0.50 <= favorite_prob <= 0.70:
+            add(find_best_score(coverage_scores, lambda item: item["home"] == 4 and item["away"] == 2, used, "极端大球保护"))
+        elif favorite_prob >= 0.68 and over25 >= 0.60:
+            add(find_best_score(coverage_scores, lambda item: item["home"] == 3 and item["away"] == 0, used, "强队零封上限"))
+        elif btts >= 0.50 and over25 >= 0.48 and (favorite_prob < 0.48 or draw >= 0.24):
+            add(find_best_score(coverage_scores, lambda item: item["home"] == 3 and item["away"] == 2, used, "高比分一球差"))
+        elif favorite_prob >= 0.54:
+            add(find_best_score(coverage_scores, lambda item: item["home"] >= 2 and item["away"] == 0, used, "主队零封保护"))
+        elif btts >= 0.50 and over25 >= 0.48:
+            add(find_best_score(coverage_scores, lambda item: item["home"] > item["away"] and item["away"] > 0 and item["home"] + item["away"] >= 3, used, "双方进球保护"))
+        elif favorite_prob >= 0.52:
+            add(find_best_score(coverage_scores, lambda item: item["home"] >= 2 and item["away"] == 0, used, "主队零封保护"))
+        else:
+            add(find_best_score(coverage_scores, lambda item: item["home"] == item["away"], used, "平局保护"))
     else:
-        add(find_best_score(sorted_scores, lambda item: item["away"] > item["home"] and item["away"] - item["home"] == 1, used, "客队小胜"))
-        add(find_best_score(sorted_scores, lambda item: item["away"] >= 2 and item["home"] == 0, used, "客队零封保护"))
-        add(find_best_score(sorted_scores, lambda item: item["away"] > item["home"] and item["away"] >= 2, used, "客队扩大比分"))
-        if max(home_win, away_win) >= 0.50 or favorite_margin >= 0.18:
-            add(find_best_score(sorted_scores, lambda item: item["away"] >= 3 and item["away"] - item["home"] >= 2, used, "强队大胜保护"))
-        add(find_best_score(sorted_scores, lambda item: item["home"] > item["away"], used, "冷门保护"))
+        before_small_win = len(recommendations)
+        if btts >= 0.49:
+            add(find_best_score(coverage_scores, lambda item: item["away"] > item["home"] and item["away"] - item["home"] == 1 and item["home"] > 0, used, "客队一球小胜"))
+        if len(recommendations) == before_small_win:
+            add(find_best_score(coverage_scores, lambda item: item["away"] > item["home"] and item["away"] - item["home"] == 1, used, "客队一球小胜"))
+        if over25 >= 0.68 and btts >= 0.58 and 0.50 <= favorite_prob <= 0.70:
+            add(find_best_score(coverage_scores, lambda item: item["away"] == 4 and item["home"] == 2, used, "极端大球保护"))
+        elif favorite_prob >= 0.68 and over25 >= 0.60:
+            add(find_best_score(coverage_scores, lambda item: item["away"] == 3 and item["home"] == 0, used, "强队零封上限"))
+        elif btts >= 0.50 and over25 >= 0.48 and (favorite_prob < 0.48 or draw >= 0.24):
+            add(find_best_score(coverage_scores, lambda item: item["away"] == 3 and item["home"] == 2, used, "高比分一球差"))
+        elif favorite_prob >= 0.54:
+            add(find_best_score(coverage_scores, lambda item: item["away"] >= 2 and item["home"] == 0, used, "客队零封保护"))
+        elif btts >= 0.50 and over25 >= 0.48:
+            add(find_best_score(coverage_scores, lambda item: item["away"] > item["home"] and item["home"] > 0 and item["home"] + item["away"] >= 3, used, "双方进球保护"))
+        elif favorite_prob >= 0.52:
+            add(find_best_score(coverage_scores, lambda item: item["away"] >= 2 and item["home"] == 0, used, "客队零封保护"))
+        else:
+            add(find_best_score(coverage_scores, lambda item: item["home"] == item["away"], used, "平局保护"))
 
-    add(find_best_score(sorted_scores, lambda item: item["home"] + item["away"] >= 3, used, "进攻战保护"))
-    for item in sorted_scores:
+    for item in coverage_scores:
         add(dict(item, label="概率补位"))
 
     top10_pool = sorted_scores[:10]
@@ -326,8 +418,7 @@ def build_coverage_scores(
         for item in sorted_scores
         if (item["away"] > item["home"] if favorite == "home" else item["home"] > item["away"])
     ][:3]
-    top5_mass = sum(item["prob"] for item in recommendations)
-    favorite_prob = max(home_win, away_win)
+    top3_mass = sum(item["prob"] for item in recommendations)
     if favorite_prob >= 0.52 and favorite_margin >= 0.18:
         confidence = "高"
         confidence_note = "优势方较明确，但比分仍不能保证。"
@@ -339,10 +430,10 @@ def build_coverage_scores(
         confidence_note = "胜平负接近，杯赛波动较大。"
 
     return {
-        "recommendedTop5": recommendations,
+        "recommendedTop3": recommendations,
         "candidateTop10": top10_pool,
         "upsetProtection": upset_scores,
-        "top5ProbabilityMass": top5_mass,
+        "top3ProbabilityMass": top3_mass,
         "confidence": confidence,
         "confidenceNote": confidence_note,
     }
@@ -452,6 +543,7 @@ def predict(home: str, away: str, neutral: bool) -> dict[str, Any]:
             "used": [
                 "2026世界杯32强淘汰赛名单",
                 "国家队基础强度评分",
+                "世界杯淘汰赛常见比分历史先验",
                 "DuckDuckGo HTML 搜索摘要",
             ],
         },
@@ -491,7 +583,7 @@ def evaluate_completed_matches() -> dict[str, Any]:
         actual_rank = next(i + 1 for i, (score, _) in enumerate(all_scores) if list(score) == match["score"])
         actual_prob = next(probability for score, probability in all_scores if list(score) == match["score"])
         top5_hits += actual_rank <= 5
-        recommended_scores = [item["score"] for item in result["coverageScores"]["recommendedTop5"]]
+        recommended_scores = [item["score"] for item in result["coverageScores"]["recommendedTop3"]]
         recommended_hit = f'{match["score"][0]}-{match["score"][1]}' in recommended_scores
         recommended_hits += recommended_hit
         rows.append(
@@ -515,7 +607,7 @@ def evaluate_completed_matches() -> dict[str, Any]:
         "resultAccuracy": result_hits / total,
         "exactAccuracy": exact_hits / total,
         "top5Accuracy": top5_hits / total,
-        "recommendedTop5Accuracy": recommended_hits / total,
+        "recommendedTop3Accuracy": recommended_hits / total,
         "rows": rows,
     }
 

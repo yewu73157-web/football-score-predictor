@@ -15,6 +15,7 @@ from flask import Flask, jsonify, render_template, request
 
 
 app = Flask(__name__)
+APP_VERSION = "20260702-compat1"
 
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 football-score-predictor/1.0 (local analytics app)"
@@ -431,9 +432,11 @@ def build_coverage_scores(
 
     return {
         "recommendedTop3": recommendations,
+        "recommendedTop5": recommendations,
         "candidateTop10": top10_pool,
         "upsetProtection": upset_scores,
         "top3ProbabilityMass": top3_mass,
+        "top5ProbabilityMass": top3_mass,
         "confidence": confidence,
         "confidenceNote": confidence_note,
     }
@@ -608,13 +611,14 @@ def evaluate_completed_matches() -> dict[str, Any]:
         "exactAccuracy": exact_hits / total,
         "top5Accuracy": top5_hits / total,
         "recommendedTop3Accuracy": recommended_hits / total,
+        "recommendedTop5Accuracy": recommended_hits / total,
         "rows": rows,
     }
 
 
 @app.get("/")
 def index():
-    return render_template("index.html", teams=KNOCKOUT_TEAMS)
+    return render_template("index.html", teams=KNOCKOUT_TEAMS, app_version=APP_VERSION)
 
 
 @app.get("/api/predict")

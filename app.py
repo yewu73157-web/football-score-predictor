@@ -3,10 +3,11 @@ from __future__ import annotations
 import math
 import os
 import re
+import json
+import sqlite3
 import time
 from dataclasses import dataclass
 from difflib import get_close_matches
-from functools import lru_cache
 from typing import Any
 from urllib.parse import quote_plus
 
@@ -15,7 +16,9 @@ from flask import Flask, jsonify, render_template, request
 
 
 app = Flask(__name__)
-APP_VERSION = "20260702-draw-upside1"
+APP_VERSION = "20260702-search-db1"
+SEARCH_CACHE_TTL_SECONDS = int(os.environ.get("SEARCH_CACHE_TTL_SECONDS", str(6 * 60 * 60)))
+SEARCH_DB_PATH = os.environ.get("SEARCH_DB_PATH", os.path.join(app.root_path, "data", "web_signals.sqlite3"))
 
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 football-score-predictor/1.0 (local analytics app)"
@@ -192,6 +195,58 @@ def http_get(url: str, timeout: int = 8) -> str:
     return response.text
 
 
+def init_search_db() -> None:
+    os.makedirs(os.path.dirname(SEARCH_DB_PATH), exist_ok=True)
+    with sqlite3.connect(SEARCH_DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS web_signal_cache (
+                team_key TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                fetched_at INTEGER NOT NULL
+            )
+            """
+        )
+
+
+def cached_payload_age(fetched_at: int) -> int:
+    return max(0, int(time.time()) - int(fetched_at))
+
+
+def read_cached_web_signals(team_key: str) -> dict[str, Any] | None:
+    init_search_db()
+    with sqlite3.connect(SEARCH_DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT payload, fetched_at FROM web_signal_cache WHERE team_key = ?",
+            (team_key,),
+        ).fetchone()
+    if not row:
+        return None
+    payload = json.loads(row[0])
+    age = cached_payload_age(row[1])
+    if age > SEARCH_CACHE_TTL_SECONDS:
+        return None
+    payload["cache"] = {"hit": True, "ageSeconds": age, "ttlSeconds": SEARCH_CACHE_TTL_SECONDS}
+    return payload
+
+
+def write_cached_web_signals(team_key: str, payload: dict[str, Any]) -> None:
+    init_search_db()
+    clean_payload = dict(payload)
+    clean_payload.pop("cache", None)
+    with sqlite3.connect(SEARCH_DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO web_signal_cache(team_key, payload, fetched_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(team_key) DO UPDATE SET
+                payload = excluded.payload,
+                fetched_at = excluded.fetched_at
+            """,
+            (team_key, json.dumps(clean_payload, ensure_ascii=False), int(time.time())),
+        )
+
+
 def offline_web_signals(team: str) -> dict[str, Any]:
     return {
         "ok": False,
@@ -205,16 +260,32 @@ def offline_web_signals(team: str) -> dict[str, Any]:
     }
 
 
-@lru_cache(maxsize=96)
 def search_web_signals(team: str) -> dict[str, Any]:
     profile = resolve_team(team)
     search_name = profile.en if profile else clean_team_name(team)
+    team_key = (profile.zh if profile else search_name).strip().lower()
+    cached = read_cached_web_signals(team_key)
+    if cached:
+        return cached
+
     query = f"{search_name} World Cup 2026 injuries lineup recent form knockout"
     url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
     try:
         html = http_get(url, timeout=4)
     except Exception as exc:
-        return {"ok": False, "query": query, "items": [], "risk": 0.0, "error": str(exc)}
+        fallback = {
+            "ok": False,
+            "query": query,
+            "items": [],
+            "risk": 0.0,
+            "form": 0.0,
+            "signalQuality": 0.0,
+            "relevantHits": 0,
+            "error": str(exc),
+            "cache": {"hit": False, "ageSeconds": 0, "ttlSeconds": SEARCH_CACHE_TTL_SECONDS},
+        }
+        write_cached_web_signals(team_key, fallback)
+        return fallback
 
     titles = re.findall(r'class="result__a"[^>]*>(.*?)</a>', html, flags=re.S)
     snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', html, flags=re.S)
@@ -257,7 +328,7 @@ def search_web_signals(team: str) -> dict[str, Any]:
     weak_words = ["lost", "loss", "struggled", "eliminated", "defeat", "输", "出局", "低迷"]
     raw_form = (sum(text_blob.lower().count(w) for w in form_words) - sum(text_blob.lower().count(w) for w in weak_words)) * 0.01 * signal_quality
     form = max(-0.05, min(0.05, raw_form))
-    return {
+    payload = {
         "ok": True,
         "query": query,
         "items": items,
@@ -265,7 +336,10 @@ def search_web_signals(team: str) -> dict[str, Any]:
         "form": form,
         "signalQuality": signal_quality,
         "relevantHits": relevant_hits,
+        "cache": {"hit": False, "ageSeconds": 0, "ttlSeconds": SEARCH_CACHE_TTL_SECONDS},
     }
+    write_cached_web_signals(team_key, payload)
+    return payload
 
 
 def poisson(k: int, lam: float) -> float:

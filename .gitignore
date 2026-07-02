@@ -4,3 +4,4 @@ __pycache__/
 tools/
 current-public-url.txt
 .env
+data/

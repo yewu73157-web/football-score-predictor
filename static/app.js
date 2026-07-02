@@ -97,6 +97,14 @@ function itemText(item) {
   return `${item.title || "搜索结果"}${snippet}`;
 }
 
+function cacheText(signal) {
+  const cache = signal && signal.cache;
+  if (!cache) return "未使用缓存";
+  if (!cache.hit) return "本次已联网并写入数据库";
+  const minutes = Math.max(0, Math.round(cache.ageSeconds / 60));
+  return `数据库缓存命中，约 ${minutes} 分钟前更新`;
+}
+
 function renderSources(data) {
   const [homeProfile, awayProfile] = data.sources.profiles;
   const [homeNews, awayNews] = data.sources.webSignals;
@@ -114,7 +122,9 @@ function renderSources(data) {
     <div class="source-card">
       <strong>伤停与阵容搜索</strong>
       <p>${data.homeInput}：${itemText(homeNews.items && homeNews.items[0])}</p>
+      <p>${cacheText(homeNews)}</p>
       <p>${data.awayInput}：${itemText(awayNews.items && awayNews.items[0])}</p>
+      <p>${cacheText(awayNews)}</p>
     </div>
   `;
 }

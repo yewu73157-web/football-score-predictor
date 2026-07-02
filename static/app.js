@@ -107,7 +107,8 @@ function renderSources(data) {
     </div>
     <div class="source-card">
       <strong>模型因子</strong>
-      <p>使用国家队基础强度、本届赛事状态、东道主优势、淘汰赛保守系数、历史淘汰赛比分先验、是否同洲际对手、联网搜索中的近况和伤停关键词来修正预期进球。</p>
+      <p>使用国家队基础强度、本届赛事状态、东道主优势、淘汰赛保守系数、历史淘汰赛比分先验、90分钟常规时间校准、是否同洲际对手、联网搜索中的近况和伤停关键词来修正预期进球。</p>
+      <p>预测口径：${data.timeScope || "90分钟常规时间，不含加时赛和点球大战"}。</p>
       <p>搜索质量：${pct(data.dataQuality.searchQuality || 0)}。${data.dataQuality.searchNote || ""}</p>
     </div>
     <div class="source-card">
@@ -213,7 +214,7 @@ async function runPrediction(event) {
     renderMatrix(data.matrix);
     renderSources(data);
     dashboard.hidden = false;
-    setStatus(`预测完成：${data.generatedAt}。${data.dataQuality.note}`);
+    setStatus(`预测完成：${data.generatedAt}。${data.timeScope || "90分钟常规时间"}。${data.dataQuality.note}`);
   } catch (error) {
     const message = error.name === "AbortError" ? "联网搜索超时，请稍后重试或刷新页面。" : error.message;
     setStatus(message, true);

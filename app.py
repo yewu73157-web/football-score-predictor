@@ -15,7 +15,7 @@ from flask import Flask, jsonify, render_template, request
 
 
 app = Flask(__name__)
-APP_VERSION = "20260702-fast-backtest1"
+APP_VERSION = "20260702-regulation-time1"
 
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 football-score-predictor/1.0 (local analytics app)"
@@ -298,6 +298,36 @@ def build_score_matrix(home_lam: float, away_lam: float) -> list[list[float]]:
     return [[value / total for value in row] for row in matrix]
 
 
+def apply_regulation_time_prior(matrix: list[list[float]]) -> list[list[float]]:
+    adjusted = []
+    total = 0.0
+    for h, row in enumerate(matrix):
+        adjusted_row = []
+        for a, value in enumerate(row):
+            goals = h + a
+            margin = abs(h - a)
+            multiplier = 1.0
+
+            # Regular-time knockout matches are more conservative than final
+            # results after extra time or penalties. Keep the correction modest.
+            if h == a:
+                multiplier *= 1.12
+            if goals <= 2:
+                multiplier *= 1.08
+            if margin == 1 and goals <= 3:
+                multiplier *= 1.05
+            if goals >= 5:
+                multiplier *= 0.78
+            if goals >= 6:
+                multiplier *= 0.72
+
+            adjusted_value = value * multiplier
+            adjusted_row.append(adjusted_value)
+            total += adjusted_value
+        adjusted.append(adjusted_row)
+    return [[value / total for value in row] for row in adjusted]
+
+
 def score_item(home_goals: int, away_goals: int, probability: float, label: str = "") -> dict[str, Any]:
     return {
         "score": f"{home_goals}-{away_goals}",
@@ -445,6 +475,14 @@ def build_coverage_scores(
 
     top10_pool = [dict(item, label=item.get("label") or "90%候选") for item in top5_scores]
     top10_used = {item["score"] for item in top10_pool}
+    if btts >= 0.45 and over25 >= 0.38 and (draw >= 0.26 or favorite_prob < 0.48):
+        if favorite == "home":
+            high_score_tail = find_best_score(coverage_scores, lambda item: item["home"] == 3 and item["away"] == 2, top10_used, "高比分尾部保护")
+        else:
+            high_score_tail = find_best_score(coverage_scores, lambda item: item["away"] == 3 and item["home"] == 2, top10_used, "高比分尾部保护")
+        if high_score_tail:
+            top10_pool.append(high_score_tail)
+            top10_used.add(high_score_tail["score"])
     for item in coverage_scores:
         if item["score"] not in top10_used:
             candidate = dict(item)
@@ -509,9 +547,9 @@ def predict(home: str, away: str, neutral: bool, use_web: bool = True) -> dict[s
     away_news_form, away_news_risk = news_adjustment(away_news)
 
     rating_gap = (home_profile.rating - away_profile.rating) / 400.0
-    base_home = 1.36 if not neutral else 1.28
-    base_away = 1.16 if not neutral else 1.28
-    knockout_conservatism = -0.025
+    base_home = 1.32 if not neutral else 1.24
+    base_away = 1.12 if not neutral else 1.24
+    knockout_conservatism = -0.07
     same_confed_drag = -0.015 if home_profile.confed == away_profile.confed else 0.0
     host_home = 0.0 if neutral else home_profile.host
     host_away = 0.0 if neutral else away_profile.host
@@ -540,7 +578,7 @@ def predict(home: str, away: str, neutral: bool, use_web: bool = True) -> dict[s
     home_lam = max(0.25, min(4.3, home_lam))
     away_lam = max(0.25, min(4.3, away_lam))
 
-    matrix = build_score_matrix(home_lam, away_lam)
+    matrix = apply_regulation_time_prior(build_score_matrix(home_lam, away_lam))
     home_win = draw = away_win = over25 = btts = 0.0
     top_scores = []
     for h, row in enumerate(matrix):
@@ -568,6 +606,7 @@ def predict(home: str, away: str, neutral: bool, use_web: bool = True) -> dict[s
         "homeInput": home_profile.zh,
         "awayInput": away_profile.zh,
         "neutral": neutral,
+        "timeScope": "90分钟常规时间，不含加时赛和点球大战",
         "homeLambda": home_lam,
         "awayLambda": away_lam,
         "probabilities": {
@@ -584,7 +623,7 @@ def predict(home: str, away: str, neutral: bool, use_web: bool = True) -> dict[s
         "dataQuality": {
             "score": round(data_points / 4 * 100),
             "level": "高" if data_points >= 4 else "中",
-            "note": "球队范围已限制为2026世界杯32强淘汰赛队伍；预测搜索只在单场预测时执行，回测使用离线模式以保证页面速度。",
+            "note": "预测口径为90分钟常规时间，不含加时赛和点球；回测使用离线模式以保证页面速度。",
             "searchQuality": search_quality,
             "searchNote": "搜索摘要命中球队名称时才会参与模型修正；泛化新闻会被降权。",
         },
@@ -595,6 +634,7 @@ def predict(home: str, away: str, neutral: bool, use_web: bool = True) -> dict[s
                 "2026世界杯32强淘汰赛名单",
                 "国家队基础强度评分",
                 "世界杯淘汰赛常见比分历史先验",
+                "90分钟常规时间比分校准",
                 "DuckDuckGo HTML 搜索摘要",
             ],
         },

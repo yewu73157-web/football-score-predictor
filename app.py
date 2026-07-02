@@ -16,12 +16,16 @@ from flask import Flask, jsonify, render_template, request
 
 
 app = Flask(__name__)
-APP_VERSION = "20260702-search-db1"
-SEARCH_CACHE_TTL_SECONDS = int(os.environ.get("SEARCH_CACHE_TTL_SECONDS", str(6 * 60 * 60)))
+APP_VERSION = "20260702-sporttery-odds1"
+SEARCH_CACHE_TTL_SECONDS = int(os.environ.get("SEARCH_CACHE_TTL_SECONDS", str(24 * 60 * 60)))
+ODDS_CACHE_TTL_SECONDS = int(os.environ.get("ODDS_CACHE_TTL_SECONDS", str(30 * 60)))
 SEARCH_DB_PATH = os.environ.get("SEARCH_DB_PATH", os.path.join(app.root_path, "data", "web_signals.sqlite3"))
+SPORTTERY_ODDS_URL = "https://webapi.sporttery.cn/gateway/uniform/football/getMatchCalculatorV1.qry?channel=m&poolCode=had"
 
 HTTP_HEADERS = {
-    "User-Agent": "Mozilla/5.0 football-score-predictor/1.0 (local analytics app)"
+    "User-Agent": "Mozilla/5.0 football-score-predictor/1.0 (local analytics app)",
+    "Referer": "https://m.sporttery.cn/mjc/jsq/zqspf/",
+    "Accept": "application/json,text/plain,*/*",
 }
 
 KNOCKOUT_TEAMS = [
@@ -207,13 +211,22 @@ def init_search_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS odds_cache (
+                cache_key TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                fetched_at INTEGER NOT NULL
+            )
+            """
+        )
 
 
 def cached_payload_age(fetched_at: int) -> int:
     return max(0, int(time.time()) - int(fetched_at))
 
 
-def read_cached_web_signals(team_key: str) -> dict[str, Any] | None:
+def read_cached_web_signals(team_key: str, allow_expired: bool = False) -> dict[str, Any] | None:
     init_search_db()
     with sqlite3.connect(SEARCH_DB_PATH) as conn:
         row = conn.execute(
@@ -224,9 +237,14 @@ def read_cached_web_signals(team_key: str) -> dict[str, Any] | None:
         return None
     payload = json.loads(row[0])
     age = cached_payload_age(row[1])
-    if age > SEARCH_CACHE_TTL_SECONDS:
+    if age > SEARCH_CACHE_TTL_SECONDS and not allow_expired:
         return None
-    payload["cache"] = {"hit": True, "ageSeconds": age, "ttlSeconds": SEARCH_CACHE_TTL_SECONDS}
+    payload["cache"] = {
+        "hit": True,
+        "stale": age > SEARCH_CACHE_TTL_SECONDS,
+        "ageSeconds": age,
+        "ttlSeconds": SEARCH_CACHE_TTL_SECONDS,
+    }
     return payload
 
 
@@ -245,6 +263,169 @@ def write_cached_web_signals(team_key: str, payload: dict[str, Any]) -> None:
             """,
             (team_key, json.dumps(clean_payload, ensure_ascii=False), int(time.time())),
         )
+
+
+def read_cached_odds(allow_expired: bool = False) -> dict[str, Any] | None:
+    init_search_db()
+    with sqlite3.connect(SEARCH_DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT payload, fetched_at FROM odds_cache WHERE cache_key = 'sporttery_had'",
+        ).fetchone()
+    if not row:
+        return None
+    payload = json.loads(row[0])
+    age = cached_payload_age(row[1])
+    if age > ODDS_CACHE_TTL_SECONDS and not allow_expired:
+        return None
+    payload["cache"] = {
+        "hit": True,
+        "stale": age > ODDS_CACHE_TTL_SECONDS,
+        "ageSeconds": age,
+        "ttlSeconds": ODDS_CACHE_TTL_SECONDS,
+    }
+    return payload
+
+
+def write_cached_odds(payload: dict[str, Any]) -> None:
+    init_search_db()
+    clean_payload = dict(payload)
+    clean_payload.pop("cache", None)
+    with sqlite3.connect(SEARCH_DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO odds_cache(cache_key, payload, fetched_at)
+            VALUES ('sporttery_had', ?, ?)
+            ON CONFLICT(cache_key) DO UPDATE SET
+                payload = excluded.payload,
+                fetched_at = excluded.fetched_at
+            """,
+            (json.dumps(clean_payload, ensure_ascii=False), int(time.time())),
+        )
+
+
+def normalize_name_for_match(name: str) -> str:
+    return re.sub(r"[\s·（）()队]", "", clean_team_name(name)).lower()
+
+
+def flatten_sporttery_matches(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    matches = []
+    for date_group in payload.get("value", {}).get("matchInfoList", []):
+        for match in date_group.get("subMatchList", []):
+            had = match.get("had") or {}
+            try:
+                odds = {
+                    "home": float(had["h"]),
+                    "draw": float(had["d"]),
+                    "away": float(had["a"]),
+                }
+            except (KeyError, TypeError, ValueError):
+                continue
+            matches.append(
+                {
+                    "matchId": str(match.get("matchId", "")),
+                    "matchNum": match.get("matchNumStr", ""),
+                    "league": match.get("leagueAllName", ""),
+                    "matchDate": match.get("matchDate", ""),
+                    "matchTime": match.get("matchTime", ""),
+                    "homeTeam": match.get("homeTeamAllName") or match.get("homeTeamAbbName", ""),
+                    "awayTeam": match.get("awayTeamAllName") or match.get("awayTeamAbbName", ""),
+                    "odds": odds,
+                    "updatedAt": f"{had.get('updateDate', '')} {had.get('updateTime', '')}".strip(),
+                }
+            )
+    return matches
+
+
+def fetch_sporttery_odds() -> dict[str, Any]:
+    cached = read_cached_odds()
+    if cached:
+        return cached
+    try:
+        response = requests.get(SPORTTERY_ODDS_URL, headers=HTTP_HEADERS, timeout=3)
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("success"):
+            raise ValueError(payload.get("errorMessage") or "竞彩赔率接口返回失败")
+        odds_payload = {
+            "ok": True,
+            "source": "中国体育彩票胜平负公开赔率",
+            "url": "https://m.sporttery.cn/mjc/jsq/zqspf/",
+            "matches": flatten_sporttery_matches(payload),
+            "error": "",
+            "cache": {"hit": False, "ageSeconds": 0, "ttlSeconds": ODDS_CACHE_TTL_SECONDS},
+        }
+    except Exception as exc:
+        stale = read_cached_odds(allow_expired=True)
+        if stale and stale.get("ok"):
+            stale["error"] = f"竞彩接口暂不可用，已使用过期缓存：{exc}"
+            return stale
+        odds_payload = {
+            "ok": False,
+            "source": "中国体育彩票胜平负公开赔率",
+            "url": "https://m.sporttery.cn/mjc/jsq/zqspf/",
+            "matches": [],
+            "error": str(exc),
+            "cache": {"hit": False, "ageSeconds": 0, "ttlSeconds": ODDS_CACHE_TTL_SECONDS},
+        }
+    write_cached_odds(odds_payload)
+    return odds_payload
+
+
+def implied_market_probs(odds: dict[str, float]) -> dict[str, float]:
+    inv_home = 1 / odds["home"]
+    inv_draw = 1 / odds["draw"]
+    inv_away = 1 / odds["away"]
+    total = inv_home + inv_draw + inv_away
+    return {"homeWin": inv_home / total, "draw": inv_draw / total, "awayWin": inv_away / total}
+
+
+def find_market_signal(home_profile: TeamProfile, away_profile: TeamProfile, use_market: bool) -> dict[str, Any]:
+    if not use_market:
+        return {"ok": False, "used": False, "reason": "离线模式未读取赔率。"}
+    payload = fetch_sporttery_odds()
+    home_key = normalize_name_for_match(home_profile.zh)
+    away_key = normalize_name_for_match(away_profile.zh)
+    for match in payload.get("matches", []):
+        market_home = normalize_name_for_match(match.get("homeTeam", ""))
+        market_away = normalize_name_for_match(match.get("awayTeam", ""))
+        if home_key in market_home and away_key in market_away:
+            return {
+                "ok": True,
+                "used": True,
+                "source": payload.get("source"),
+                "url": payload.get("url"),
+                "match": match,
+                "implied": implied_market_probs(match["odds"]),
+                "cache": payload.get("cache"),
+            }
+        if home_key in market_away and away_key in market_home:
+            reversed_odds = {
+                "home": match["odds"]["away"],
+                "draw": match["odds"]["draw"],
+                "away": match["odds"]["home"],
+            }
+            reversed_match = dict(match)
+            reversed_match["homeTeam"] = match["awayTeam"]
+            reversed_match["awayTeam"] = match["homeTeam"]
+            reversed_match["odds"] = reversed_odds
+            return {
+                "ok": True,
+                "used": True,
+                "source": payload.get("source"),
+                "url": payload.get("url"),
+                "match": reversed_match,
+                "implied": implied_market_probs(reversed_odds),
+                "cache": payload.get("cache"),
+            }
+    return {
+        "ok": False,
+        "used": False,
+        "source": payload.get("source"),
+        "url": payload.get("url"),
+        "error": payload.get("error", ""),
+        "reason": "竞彩当前列表没有匹配到这场比赛。",
+        "cache": payload.get("cache"),
+    }
 
 
 def offline_web_signals(team: str) -> dict[str, Any]:
@@ -271,8 +452,12 @@ def search_web_signals(team: str) -> dict[str, Any]:
     query = f"{search_name} World Cup 2026 injuries lineup recent form knockout"
     url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
     try:
-        html = http_get(url, timeout=4)
+        html = http_get(url, timeout=3)
     except Exception as exc:
+        stale = read_cached_web_signals(team_key, allow_expired=True)
+        if stale:
+            stale["error"] = f"联网搜索暂不可用，已使用过期缓存：{exc}"
+            return stale
         fallback = {
             "ok": False,
             "query": query,
@@ -402,6 +587,48 @@ def apply_regulation_time_prior(matrix: list[list[float]]) -> list[list[float]]:
     return [[value / total for value in row] for row in adjusted]
 
 
+def matrix_outcome_probs(matrix: list[list[float]]) -> dict[str, float]:
+    home_win = draw = away_win = 0.0
+    for h, row in enumerate(matrix):
+        for a, value in enumerate(row):
+            if h > a:
+                home_win += value
+            elif h == a:
+                draw += value
+            else:
+                away_win += value
+    return {"homeWin": home_win, "draw": draw, "awayWin": away_win}
+
+
+def apply_market_prior(matrix: list[list[float]], market_signal: dict[str, Any]) -> list[list[float]]:
+    if not market_signal.get("ok"):
+        return matrix
+    implied = market_signal.get("implied") or {}
+    model = matrix_outcome_probs(matrix)
+    adjusted = []
+    total = 0.0
+    # Market odds are useful but not omniscient. A fractional exponent keeps the
+    # model from blindly following crowd price moves.
+    strength = 0.38
+    for h, row in enumerate(matrix):
+        adjusted_row = []
+        for a, value in enumerate(row):
+            if h > a:
+                key = "homeWin"
+            elif h == a:
+                key = "draw"
+            else:
+                key = "awayWin"
+            market_prob = max(0.01, float(implied.get(key, model[key])))
+            model_prob = max(0.01, model[key])
+            multiplier = (market_prob / model_prob) ** strength
+            adjusted_value = value * multiplier
+            adjusted_row.append(adjusted_value)
+            total += adjusted_value
+        adjusted.append(adjusted_row)
+    return [[value / total for value in row] for row in adjusted]
+
+
 def score_item(home_goals: int, away_goals: int, probability: float, label: str = "") -> dict[str, Any]:
     return {
         "score": f"{home_goals}-{away_goals}",
@@ -472,6 +699,7 @@ def build_coverage_scores(
     home_win: float,
     draw: float,
     away_win: float,
+    market_signal: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     used: set[str] = set()
     recommendations: list[dict[str, Any]] = []
@@ -482,6 +710,12 @@ def build_coverage_scores(
     over25 = sum(item["prob"] for item in all_scores if item["home"] + item["away"] >= 3)
     btts = sum(item["prob"] for item in all_scores if item["home"] > 0 and item["away"] > 0)
     coverage_scores = apply_historical_prior(all_scores, favorite, favorite_prob, draw, over25, btts)
+    market_home_gap = 0.0
+    market_draw = 0.0
+    if market_signal and market_signal.get("ok"):
+        implied = market_signal.get("implied") or {}
+        market_home_gap = abs(float(implied.get("homeWin", home_win)) - float(implied.get("awayWin", away_win)))
+        market_draw = float(implied.get("draw", draw))
 
     def add(candidate: dict[str, Any] | None) -> None:
         if candidate and candidate["score"] not in used and len(recommendations) < 3:
@@ -536,6 +770,19 @@ def build_coverage_scores(
 
     for item in coverage_scores:
         add(dict(item, label="概率补位"))
+
+    if market_signal and market_signal.get("ok") and market_home_gap >= 0.22 and market_draw <= 0.28:
+        clean_sheet_score = "2-0" if favorite == "home" else "0-2"
+        if clean_sheet_score not in used:
+            market_clean = find_best_score(
+                coverage_scores,
+                lambda item: item["score"] == clean_sheet_score,
+                used,
+                "赔率强弱差保护",
+            )
+            if market_clean and recommendations:
+                recommendations[-1] = market_clean
+                used.add(clean_sheet_score)
 
     top3_scores = recommendations[:]
     top5_scores = [dict(item) for item in top3_scores]
@@ -629,6 +876,7 @@ def predict(home: str, away: str, neutral: bool, use_web: bool = True) -> dict[s
     else:
         home_news = offline_web_signals(home)
         away_news = offline_web_signals(away)
+    market_signal = find_market_signal(home_profile, away_profile, use_market=use_web)
     home_news_form, home_news_risk = news_adjustment(home_news)
     away_news_form, away_news_risk = news_adjustment(away_news)
 
@@ -664,7 +912,7 @@ def predict(home: str, away: str, neutral: bool, use_web: bool = True) -> dict[s
     home_lam = max(0.25, min(4.3, home_lam))
     away_lam = max(0.25, min(4.3, away_lam))
 
-    matrix = apply_regulation_time_prior(build_score_matrix(home_lam, away_lam))
+    matrix = apply_market_prior(apply_regulation_time_prior(build_score_matrix(home_lam, away_lam)), market_signal)
     home_win = draw = away_win = over25 = btts = 0.0
     top_scores = []
     for h, row in enumerate(matrix):
@@ -681,11 +929,12 @@ def predict(home: str, away: str, neutral: bool, use_web: bool = True) -> dict[s
                 btts += p
             top_scores.append(score_item(h, a, p))
     top_scores.sort(key=lambda item: item["prob"], reverse=True)
-    coverage = build_coverage_scores(top_scores, home_win, draw, away_win)
+    coverage = build_coverage_scores(top_scores, home_win, draw, away_win, market_signal)
 
     data_points = 2
     data_points += 1 if home_news.get("ok") else 0
     data_points += 1 if away_news.get("ok") else 0
+    data_points += 1 if market_signal.get("ok") else 0
     search_quality = (home_news.get("signalQuality", 0.0) + away_news.get("signalQuality", 0.0)) / 2
 
     return {
@@ -707,21 +956,23 @@ def predict(home: str, away: str, neutral: bool, use_web: bool = True) -> dict[s
         "coverageScores": coverage,
         "matrix": matrix,
         "dataQuality": {
-            "score": round(data_points / 4 * 100),
+            "score": round(data_points / 5 * 100),
             "level": "高" if data_points >= 4 else "中",
-            "note": "预测口径为90分钟常规时间，不含加时赛和点球；回测使用离线模式以保证页面速度。",
+            "note": "预测口径为90分钟常规时间，不含加时赛和点球；竞彩赔率命中时会作为市场先验参与校准。",
             "searchQuality": search_quality,
             "searchNote": "搜索摘要命中球队名称时才会参与模型修正；泛化新闻会被降权。",
         },
         "sources": {
             "profiles": [home_profile.__dict__, away_profile.__dict__],
             "webSignals": [home_news, away_news],
+            "marketSignal": market_signal,
             "used": [
                 "2026世界杯32强淘汰赛名单",
                 "国家队基础强度评分",
                 "世界杯淘汰赛常见比分历史先验",
                 "90分钟常规时间比分校准",
                 "DuckDuckGo HTML 搜索摘要",
+                "中国体育彩票胜平负公开赔率",
             ],
         },
         "generatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),

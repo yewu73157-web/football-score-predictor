@@ -102,12 +102,19 @@ function cacheText(signal) {
   if (!cache) return "未使用缓存";
   if (!cache.hit) return "本次已联网并写入数据库";
   const minutes = Math.max(0, Math.round(cache.ageSeconds / 60));
-  return `数据库缓存命中，约 ${minutes} 分钟前更新`;
+  return `${cache.stale ? "使用过期数据库缓存" : "数据库缓存命中"}，约 ${minutes} 分钟前更新`;
 }
 
 function renderSources(data) {
   const [homeProfile, awayProfile] = data.sources.profiles;
   const [homeNews, awayNews] = data.sources.webSignals;
+  const market = data.sources.marketSignal || {};
+  const marketMatch = market.match || {};
+  const odds = marketMatch.odds || {};
+  const implied = market.implied || {};
+  const marketText = market.ok
+    ? `${marketMatch.homeTeam} vs ${marketMatch.awayTeam}，胜/平/负赔率 ${odds.home} / ${odds.draw} / ${odds.away}；隐含概率 ${pct(implied.homeWin)} / ${pct(implied.draw)} / ${pct(implied.awayWin)}。${cacheText(market)}`
+    : `${market.reason || "未匹配到竞彩赔率"}${market.error ? `：${market.error}` : ""}`;
   sourceSummary.innerHTML = `
     <div class="source-card">
       <strong>淘汰赛球队</strong>
@@ -115,9 +122,13 @@ function renderSources(data) {
     </div>
     <div class="source-card">
       <strong>模型因子</strong>
-      <p>使用国家队基础强度、本届赛事状态、东道主优势、淘汰赛保守系数、历史淘汰赛比分先验、90分钟常规时间校准、是否同洲际对手、联网搜索中的近况和伤停关键词来修正预期进球。</p>
+      <p>使用国家队基础强度、本届赛事状态、东道主优势、淘汰赛保守系数、历史淘汰赛比分先验、90分钟常规时间校准、是否同洲际对手、竞彩胜平负赔率、联网搜索中的近况和伤停关键词来修正预期进球。</p>
       <p>预测口径：${data.timeScope || "90分钟常规时间，不含加时赛和点球大战"}。</p>
       <p>搜索质量：${pct(data.dataQuality.searchQuality || 0)}。${data.dataQuality.searchNote || ""}</p>
+    </div>
+    <div class="source-card">
+      <strong>竞彩赔率校准</strong>
+      <p>${marketText}</p>
     </div>
     <div class="source-card">
       <strong>伤停与阵容搜索</strong>

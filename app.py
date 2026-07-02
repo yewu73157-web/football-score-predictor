@@ -15,7 +15,7 @@ from flask import Flask, jsonify, render_template, request
 
 
 app = Flask(__name__)
-APP_VERSION = "20260702-regulation-time1"
+APP_VERSION = "20260702-draw-upside1"
 
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 football-score-predictor/1.0 (local analytics app)"
@@ -100,7 +100,7 @@ COMPLETED_MATCHES = [
     {"home": "法国", "away": "瑞典", "score": [3, 0], "neutral": True},
     {"home": "墨西哥", "away": "厄瓜多尔", "score": [2, 0], "neutral": False},
     {"home": "英格兰", "away": "民主刚果", "score": [2, 1], "neutral": True},
-    {"home": "比利时", "away": "塞内加尔", "score": [3, 2], "neutral": True},
+    {"home": "比利时", "away": "塞内加尔", "score": [2, 2], "neutral": True},
     {"home": "美国", "away": "波黑", "score": [2, 0], "neutral": False},
 ]
 
@@ -378,6 +378,8 @@ def apply_historical_prior(
             multiplier *= 1.08
         if over25 < 0.50 and total_goals >= 4:
             multiplier *= 0.72
+        if candidate["score"] == "2-2" and draw >= 0.28 and btts >= 0.45 and over25 >= 0.36:
+            multiplier *= 1.65
         if candidate["score"] in {"3-2", "2-3"} and btts >= 0.50 and over25 >= 0.48 and (favorite_prob < 0.48 or draw >= 0.24):
             multiplier *= 1.55
         if candidate["score"] in {"4-2", "2-4"}:
@@ -464,6 +466,11 @@ def build_coverage_scores(
     top3_scores = recommendations[:]
     top5_scores = [dict(item) for item in top3_scores]
     top5_used = {item["score"] for item in top5_scores}
+    if draw >= 0.28 and btts >= 0.45 and over25 >= 0.36:
+        draw_upside = find_best_score(coverage_scores, lambda item: item["score"] == "2-2", top5_used, "高比分平局保护")
+        if draw_upside:
+            top5_scores.append(draw_upside)
+            top5_used.add(draw_upside["score"])
     for item in coverage_scores:
         if item["score"] not in top5_used:
             candidate = dict(item)
@@ -475,6 +482,11 @@ def build_coverage_scores(
 
     top10_pool = [dict(item, label=item.get("label") or "90%候选") for item in top5_scores]
     top10_used = {item["score"] for item in top10_pool}
+    if draw >= 0.28 and btts >= 0.45 and over25 >= 0.36 and "2-2" not in top10_used:
+        draw_tail = find_best_score(coverage_scores, lambda item: item["score"] == "2-2", top10_used, "高比分平局保护")
+        if draw_tail:
+            top10_pool.append(draw_tail)
+            top10_used.add(draw_tail["score"])
     if btts >= 0.45 and over25 >= 0.38 and (draw >= 0.26 or favorite_prob < 0.48):
         if favorite == "home":
             high_score_tail = find_best_score(coverage_scores, lambda item: item["home"] == 3 and item["away"] == 2, top10_used, "高比分尾部保护")

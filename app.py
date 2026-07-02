@@ -15,7 +15,7 @@ from flask import Flask, jsonify, render_template, request
 
 
 app = Flask(__name__)
-APP_VERSION = "20260702-compat1"
+APP_VERSION = "20260702-clean-sheet1"
 
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 football-score-predictor/1.0 (local analytics app)"
@@ -101,6 +101,7 @@ COMPLETED_MATCHES = [
     {"home": "墨西哥", "away": "厄瓜多尔", "score": [2, 0], "neutral": False},
     {"home": "英格兰", "away": "民主刚果", "score": [2, 1], "neutral": True},
     {"home": "比利时", "away": "塞内加尔", "score": [3, 2], "neutral": True},
+    {"home": "美国", "away": "波黑", "score": [2, 0], "neutral": False},
 ]
 
 # Recent World Cup knockout matches are dominated by narrow wins and low-to-medium
@@ -379,6 +380,8 @@ def build_coverage_scores(
             add(find_best_score(coverage_scores, lambda item: item["home"] == 4 and item["away"] == 2, used, "极端大球保护"))
         elif favorite_prob >= 0.68 and over25 >= 0.60:
             add(find_best_score(coverage_scores, lambda item: item["home"] == 3 and item["away"] == 0, used, "强队零封上限"))
+        elif favorite_prob >= 0.50 and away_win <= 0.27:
+            add(find_best_score(coverage_scores, lambda item: item["home"] >= 2 and item["away"] == 0, used, "主队零封保护"))
         elif btts >= 0.50 and over25 >= 0.48 and (favorite_prob < 0.48 or draw >= 0.24):
             add(find_best_score(coverage_scores, lambda item: item["home"] == 3 and item["away"] == 2, used, "高比分一球差"))
         elif favorite_prob >= 0.54:
@@ -399,6 +402,8 @@ def build_coverage_scores(
             add(find_best_score(coverage_scores, lambda item: item["away"] == 4 and item["home"] == 2, used, "极端大球保护"))
         elif favorite_prob >= 0.68 and over25 >= 0.60:
             add(find_best_score(coverage_scores, lambda item: item["away"] == 3 and item["home"] == 0, used, "强队零封上限"))
+        elif favorite_prob >= 0.50 and home_win <= 0.27:
+            add(find_best_score(coverage_scores, lambda item: item["away"] >= 2 and item["home"] == 0, used, "客队零封保护"))
         elif btts >= 0.50 and over25 >= 0.48 and (favorite_prob < 0.48 or draw >= 0.24):
             add(find_best_score(coverage_scores, lambda item: item["away"] == 3 and item["home"] == 2, used, "高比分一球差"))
         elif favorite_prob >= 0.54:

@@ -15,7 +15,7 @@ from flask import Flask, jsonify, render_template, request
 
 
 app = Flask(__name__)
-APP_VERSION = "20260702-clean-sheet1"
+APP_VERSION = "20260702-tiered-coverage1"
 
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 football-score-predictor/1.0 (local analytics app)"
@@ -418,32 +418,58 @@ def build_coverage_scores(
     for item in coverage_scores:
         add(dict(item, label="概率补位"))
 
-    top10_pool = sorted_scores[:10]
+    top3_scores = recommendations[:]
+    top5_scores = [dict(item) for item in top3_scores]
+    top5_used = {item["score"] for item in top5_scores}
+    for item in coverage_scores:
+        if item["score"] not in top5_used:
+            candidate = dict(item)
+            candidate["label"] = candidate.get("label") or "保险补位"
+            top5_scores.append(candidate)
+            top5_used.add(candidate["score"])
+        if len(top5_scores) >= 5:
+            break
+
+    top10_pool = [dict(item, label=item.get("label") or "90%候选") for item in top5_scores]
+    top10_used = {item["score"] for item in top10_pool}
+    for item in coverage_scores:
+        if item["score"] not in top10_used:
+            candidate = dict(item)
+            candidate["label"] = "90%候选"
+            top10_pool.append(candidate)
+            top10_used.add(candidate["score"])
+        if len(top10_pool) >= 10:
+            break
+
     upset_scores = [
         dict(item, label="冷门保护")
         for item in sorted_scores
         if (item["away"] > item["home"] if favorite == "home" else item["home"] > item["away"])
     ][:3]
-    top3_mass = sum(item["prob"] for item in recommendations)
+    top3_mass = sum(item["prob"] for item in top3_scores)
+    top5_mass = sum(item["prob"] for item in top5_scores)
+    top10_mass = sum(item["prob"] for item in top10_pool)
     if favorite_prob >= 0.52 and favorite_margin >= 0.18:
         confidence = "高"
-        confidence_note = "优势方较明确，但比分仍不能保证。"
+        confidence_note = "优势方较明确，主推3个可重点参考，保险5个用于覆盖零封和一球差。"
     elif favorite_prob >= 0.42 or draw >= 0.30:
         confidence = "中"
-        confidence_note = "有倾向，但平局或一球差结果占比较高。"
+        confidence_note = "有倾向，但平局或一球差结果占比较高，建议同时看保险5个。"
     else:
         confidence = "低"
-        confidence_note = "胜平负接近，杯赛波动较大。"
+        confidence_note = "胜平负接近，杯赛波动较大，不建议只看主推3个，应看90%候选池。"
 
     return {
-        "recommendedTop3": recommendations,
-        "recommendedTop5": recommendations,
+        "recommendedTop3": top3_scores,
+        "recommendedTop5": top5_scores,
         "candidateTop10": top10_pool,
         "upsetProtection": upset_scores,
         "top3ProbabilityMass": top3_mass,
-        "top5ProbabilityMass": top3_mass,
+        "top5ProbabilityMass": top5_mass,
+        "top10ProbabilityMass": top10_mass,
         "confidence": confidence,
         "confidenceNote": confidence_note,
+        "coverageAdvice": "高置信看主推3个；中置信看保险5个；低置信看90%候选池。",
     }
 
 
@@ -572,7 +598,9 @@ def evaluate_completed_matches() -> dict[str, Any]:
     result_hits = 0
     exact_hits = 0
     top5_hits = 0
-    recommended_hits = 0
+    recommended3_hits = 0
+    recommended5_hits = 0
+    top10_hits = 0
     for match in COMPLETED_MATCHES:
         result = predict(match["home"], match["away"], match["neutral"])
         probs = result["probabilities"]
@@ -591,13 +619,20 @@ def evaluate_completed_matches() -> dict[str, Any]:
         actual_rank = next(i + 1 for i, (score, _) in enumerate(all_scores) if list(score) == match["score"])
         actual_prob = next(probability for score, probability in all_scores if list(score) == match["score"])
         top5_hits += actual_rank <= 5
-        recommended_scores = [item["score"] for item in result["coverageScores"]["recommendedTop3"]]
-        recommended_hit = f'{match["score"][0]}-{match["score"][1]}' in recommended_scores
-        recommended_hits += recommended_hit
+        actual_score_text = f'{match["score"][0]}-{match["score"][1]}'
+        recommended3_scores = [item["score"] for item in result["coverageScores"]["recommendedTop3"]]
+        recommended5_scores = [item["score"] for item in result["coverageScores"]["recommendedTop5"]]
+        top10_scores = [item["score"] for item in result["coverageScores"]["candidateTop10"]]
+        recommended3_hit = actual_score_text in recommended3_scores
+        recommended5_hit = actual_score_text in recommended5_scores
+        top10_hit = actual_score_text in top10_scores
+        recommended3_hits += recommended3_hit
+        recommended5_hits += recommended5_hit
+        top10_hits += top10_hit
         rows.append(
             {
                 "match": f'{match["home"]} vs {match["away"]}',
-                "actualScore": f'{match["score"][0]}-{match["score"][1]}',
+                "actualScore": actual_score_text,
                 "topScore": top_score["score"],
                 "topScoreProb": top_score["prob"],
                 "actualScoreProb": actual_prob,
@@ -605,8 +640,14 @@ def evaluate_completed_matches() -> dict[str, Any]:
                 "predictedOutcome": predicted_outcome,
                 "actualOutcome": actual_outcome,
                 "outcomeHit": predicted_outcome == actual_outcome,
-                "recommendedScores": recommended_scores,
-                "recommendedHit": recommended_hit,
+                "recommendedScores": recommended3_scores,
+                "recommendedTop3Scores": recommended3_scores,
+                "recommendedTop5Scores": recommended5_scores,
+                "top10Scores": top10_scores,
+                "recommendedHit": recommended3_hit,
+                "recommendedTop3Hit": recommended3_hit,
+                "recommendedTop5Hit": recommended5_hit,
+                "top10Hit": top10_hit,
             }
         )
     total = len(COMPLETED_MATCHES)
@@ -615,8 +656,9 @@ def evaluate_completed_matches() -> dict[str, Any]:
         "resultAccuracy": result_hits / total,
         "exactAccuracy": exact_hits / total,
         "top5Accuracy": top5_hits / total,
-        "recommendedTop3Accuracy": recommended_hits / total,
-        "recommendedTop5Accuracy": recommended_hits / total,
+        "recommendedTop3Accuracy": recommended3_hits / total,
+        "recommendedTop5Accuracy": recommended5_hits / total,
+        "top10Accuracy": top10_hits / total,
         "rows": rows,
     }
 

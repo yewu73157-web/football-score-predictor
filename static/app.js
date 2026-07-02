@@ -6,6 +6,7 @@ const lambdaText = document.querySelector("#lambdaText");
 const qualityText = document.querySelector("#qualityText");
 const outcomes = document.querySelector("#outcomes");
 const topScores = document.querySelector("#topScores");
+const insuranceScores = document.querySelector("#insuranceScores");
 const candidateScores = document.querySelector("#candidateScores");
 const upsetScores = document.querySelector("#upsetScores");
 const confidenceNote = document.querySelector("#confidenceNote");
@@ -125,8 +126,9 @@ function renderBacktest(data) {
   backtestSummary.innerHTML = `
     <div class="metric"><span>胜平负方向</span><strong>${pct(data.resultAccuracy)}</strong></div>
     <div class="metric"><span>最可能比分命中</span><strong>${pct(data.exactAccuracy)}</strong></div>
-    <div class="metric"><span>概率前5覆盖</span><strong>${pct(data.top5Accuracy)}</strong></div>
     <div class="metric"><span>主推3个覆盖</span><strong>${pct(data.recommendedTop3Accuracy)}</strong></div>
+    <div class="metric"><span>保险5个覆盖</span><strong>${pct(data.recommendedTop5Accuracy)}</strong></div>
+    <div class="metric"><span>Top10覆盖</span><strong>${pct(data.top10Accuracy)}</strong></div>
   `;
   let html = `
     <thead>
@@ -136,6 +138,8 @@ function renderBacktest(data) {
         <th>模型首选</th>
         <th>实际排名</th>
         <th>主推3覆盖</th>
+        <th>保险5覆盖</th>
+        <th>Top10覆盖</th>
         <th>方向</th>
       </tr>
     </thead>
@@ -148,7 +152,9 @@ function renderBacktest(data) {
         <td>${row.actualScore}</td>
         <td>${row.topScore}（${pct(row.topScoreProb)}）</td>
         <td>第 ${row.actualScoreRank}（${pct(row.actualScoreProb)}）</td>
-        <td class="${row.recommendedHit ? "hit" : "miss"}">${row.recommendedHit ? "命中" : "未命中"}</td>
+        <td class="${row.recommendedTop3Hit ? "hit" : "miss"}">${row.recommendedTop3Hit ? "命中" : "未命中"}</td>
+        <td class="${row.recommendedTop5Hit ? "hit" : "miss"}">${row.recommendedTop5Hit ? "命中" : "未命中"}</td>
+        <td class="${row.top10Hit ? "hit" : "miss"}">${row.top10Hit ? "命中" : "未命中"}</td>
         <td class="${row.outcomeHit ? "hit" : "miss"}">${outcomeName(row.predictedOutcome)} / ${outcomeName(row.actualOutcome)}</td>
       </tr>
     `;
@@ -193,12 +199,13 @@ async function runPrediction(event) {
 
     bestScore.textContent = `${data.coverageScores.recommendedTop3[0].score}（3选覆盖）`;
     lambdaText.textContent = `${data.homeLambda.toFixed(2)} : ${data.awayLambda.toFixed(2)}`;
-    qualityText.textContent = `${data.coverageScores.confidence}（覆盖${pct(data.coverageScores.top3ProbabilityMass)}）`;
+    qualityText.textContent = `${data.coverageScores.confidence}（3:${pct(data.coverageScores.top3ProbabilityMass)} / 5:${pct(data.coverageScores.top5ProbabilityMass)} / 10:${pct(data.coverageScores.top10ProbabilityMass)}）`;
     renderBars(data.probabilities, home, away);
     renderTopScores(data.coverageScores.recommendedTop3);
+    renderScoreList(insuranceScores, data.coverageScores.recommendedTop5);
     renderScoreList(candidateScores, data.coverageScores.candidateTop10);
     renderScoreList(upsetScores, data.coverageScores.upsetProtection);
-    confidenceNote.textContent = data.coverageScores.confidenceNote;
+    confidenceNote.textContent = `${data.coverageScores.confidenceNote} ${data.coverageScores.coverageAdvice || ""}`;
     renderMatrix(data.matrix);
     renderSources(data);
     dashboard.hidden = false;

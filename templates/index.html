@@ -59,7 +59,7 @@
       <section class="dashboard" id="dashboard" hidden>
         <div class="summary">
           <div>
-            <p class="label">主推比分</p>
+            <p class="label">主推首选</p>
             <strong id="bestScore">-</strong>
           </div>
           <div>
@@ -77,17 +77,24 @@
             <h2>赛果概率</h2>
             <div id="outcomes" class="bars"></div>
           </article>
-            <article class="panel">
-              <h2>主推 3 个比分</h2>
-              <div id="topScores" class="score-list"></div>
-            </article>
+          <article class="panel">
+            <h2>主推 3 个比分</h2>
+            <div id="topScores" class="score-list"></div>
+          </article>
         </div>
 
         <div class="grid two">
           <article class="panel">
-            <h2>候选比分池 Top 10</h2>
+            <h2>保险 5 个比分</h2>
+            <div id="insuranceScores" class="score-list compact"></div>
+          </article>
+          <article class="panel">
+            <h2>90%候选池 Top 10</h2>
             <div id="candidateScores" class="score-list compact"></div>
           </article>
+        </div>
+
+        <div class="grid two">
           <article class="panel">
             <h2>冷门保护</h2>
             <div id="upsetScores" class="score-list compact"></div>
@@ -110,7 +117,7 @@
           <article class="panel">
             <h2>模型说明</h2>
             <p class="copy">
-              本工具只覆盖 2026 世界杯 32 强淘汰赛球队，预测口径为90分钟常规时间。主推3个比分采用“当前概率 + 历史淘汰赛先验 + 覆盖率”策略，覆盖最高概率、小胜路径和大球/零封保护路径。
+              本工具只覆盖 2026 世界杯 32 强淘汰赛球队，预测口径为90分钟常规时间。主推3个比分用于重点判断，保险5个用于提高覆盖，90%候选池用于低置信比赛参考。
               它不能保证百分百命中，只用于提高真实比分落入推荐池的概率。
             </p>
           </article>

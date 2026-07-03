@@ -17,12 +17,21 @@ from flask import Flask, jsonify, render_template, request
 
 
 app = Flask(__name__)
-APP_VERSION = "20260703-score-odds-sync1"
+APP_VERSION = "20260703-auto-learning1"
 SEARCH_CACHE_TTL_SECONDS = int(os.environ.get("SEARCH_CACHE_TTL_SECONDS", str(24 * 60 * 60)))
 ODDS_CACHE_TTL_SECONDS = int(os.environ.get("ODDS_CACHE_TTL_SECONDS", str(30 * 60)))
 ODDS_SYNC_TOKEN = os.environ.get("ODDS_SYNC_TOKEN", "football-score-odds-sync-2026")
+RESULTS_SYNC_TOKEN = os.environ.get("RESULTS_SYNC_TOKEN", ODDS_SYNC_TOKEN)
 SEARCH_DB_PATH = os.environ.get("SEARCH_DB_PATH", os.path.join(app.root_path, "data", "web_signals.sqlite3"))
 SPORTTERY_ODDS_URL = "https://webapi.sporttery.cn/gateway/uniform/football/getMatchCalculatorV1.qry?channel=m&poolCode=had,crs"
+
+DEFAULT_MODEL_PARAMS = {
+    "market_outcome_strength": 0.38,
+    "score_market_strength": 0.24,
+    "clean_sheet_bias": 1.00,
+    "draw_bias": 1.00,
+    "high_score_bias": 1.00,
+}
 
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 football-score-predictor/1.0 (local analytics app)",
@@ -222,6 +231,107 @@ def init_search_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS odds_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                fetched_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS prediction_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                match_key TEXT NOT NULL,
+                home_team TEXT NOT NULL,
+                away_team TEXT NOT NULL,
+                neutral INTEGER NOT NULL,
+                payload TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS completed_results (
+                match_key TEXT PRIMARY KEY,
+                home_team TEXT NOT NULL,
+                away_team TEXT NOT NULL,
+                home_goals INTEGER NOT NULL,
+                away_goals INTEGER NOT NULL,
+                neutral INTEGER NOT NULL DEFAULT 1,
+                source TEXT NOT NULL,
+                match_date TEXT DEFAULT '',
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS model_params (
+                name TEXT PRIMARY KEY,
+                value REAL NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sync_errors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sync_type TEXT NOT NULL,
+                message TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+
+
+def log_sync_error(sync_type: str, message: str) -> None:
+    init_search_db()
+    with sqlite3.connect(SEARCH_DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO sync_errors(sync_type, message, created_at) VALUES (?, ?, ?)",
+            (sync_type, message[:1000], int(time.time())),
+        )
+
+
+def model_params() -> dict[str, float]:
+    init_search_db()
+    now = int(time.time())
+    with sqlite3.connect(SEARCH_DB_PATH) as conn:
+        for name, value in DEFAULT_MODEL_PARAMS.items():
+            conn.execute(
+                "INSERT OR IGNORE INTO model_params(name, value, updated_at) VALUES (?, ?, ?)",
+                (name, value, now),
+            )
+        rows = conn.execute("SELECT name, value FROM model_params").fetchall()
+    params = dict(DEFAULT_MODEL_PARAMS)
+    params.update({name: float(value) for name, value in rows})
+    return params
+
+
+def update_model_params(updates: dict[str, float]) -> dict[str, float]:
+    init_search_db()
+    now = int(time.time())
+    with sqlite3.connect(SEARCH_DB_PATH) as conn:
+        for name, value in updates.items():
+            if name not in DEFAULT_MODEL_PARAMS:
+                continue
+            conn.execute(
+                """
+                INSERT INTO model_params(name, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (name, float(value), now),
+            )
+    return model_params()
 
 
 def cached_payload_age(fetched_at: int) -> int:
@@ -292,6 +402,8 @@ def write_cached_odds(payload: dict[str, Any]) -> None:
     init_search_db()
     clean_payload = dict(payload)
     clean_payload.pop("cache", None)
+    payload_text = json.dumps(clean_payload, ensure_ascii=False)
+    now = int(time.time())
     with sqlite3.connect(SEARCH_DB_PATH) as conn:
         conn.execute(
             """
@@ -301,8 +413,169 @@ def write_cached_odds(payload: dict[str, Any]) -> None:
                 payload = excluded.payload,
                 fetched_at = excluded.fetched_at
             """,
-            (json.dumps(clean_payload, ensure_ascii=False), int(time.time())),
+            (payload_text, now),
         )
+        if clean_payload.get("matches"):
+            conn.execute(
+                "INSERT INTO odds_snapshots(source, payload, fetched_at) VALUES (?, ?, ?)",
+                (clean_payload.get("source", "unknown"), payload_text, now),
+            )
+
+
+def prediction_match_key(home: str, away: str) -> str:
+    return f"{normalize_name_for_match(home)}::{normalize_name_for_match(away)}"
+
+
+def save_prediction_snapshot(result: dict[str, Any]) -> None:
+    init_search_db()
+    payload = json.dumps(result, ensure_ascii=False)
+    with sqlite3.connect(SEARCH_DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO prediction_snapshots(match_key, home_team, away_team, neutral, payload, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                prediction_match_key(result["homeInput"], result["awayInput"]),
+                result["homeInput"],
+                result["awayInput"],
+                1 if result.get("neutral") else 0,
+                payload,
+                int(time.time()),
+            ),
+        )
+
+
+def import_completed_results(results: list[dict[str, Any]], source: str = "GitHub Actions 自动同步赛果") -> dict[str, Any]:
+    imported = 0
+    init_search_db()
+    with sqlite3.connect(SEARCH_DB_PATH) as conn:
+        for item in results:
+            home_profile = resolve_team(str(item.get("home", "")))
+            away_profile = resolve_team(str(item.get("away", "")))
+            if not home_profile or not away_profile:
+                continue
+            try:
+                home_goals = int(item["homeGoals"])
+                away_goals = int(item["awayGoals"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            key = prediction_match_key(home_profile.zh, away_profile.zh)
+            conn.execute(
+                """
+                INSERT INTO completed_results(
+                    match_key, home_team, away_team, home_goals, away_goals,
+                    neutral, source, match_date, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(match_key) DO UPDATE SET
+                    home_goals = excluded.home_goals,
+                    away_goals = excluded.away_goals,
+                    neutral = excluded.neutral,
+                    source = excluded.source,
+                    match_date = excluded.match_date,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    key,
+                    home_profile.zh,
+                    away_profile.zh,
+                    home_goals,
+                    away_goals,
+                    1 if item.get("neutral", True) else 0,
+                    source,
+                    str(item.get("matchDate", "")),
+                    int(time.time()),
+                ),
+            )
+            imported += 1
+    return {"ok": imported > 0, "imported": imported}
+
+
+def completed_matches_from_db() -> list[dict[str, Any]]:
+    init_search_db()
+    with sqlite3.connect(SEARCH_DB_PATH) as conn:
+        rows = conn.execute(
+            """
+            SELECT home_team, away_team, home_goals, away_goals, neutral, source, match_date
+            FROM completed_results
+            ORDER BY updated_at
+            """
+        ).fetchall()
+    return [
+        {
+            "home": row[0],
+            "away": row[1],
+            "score": [int(row[2]), int(row[3])],
+            "neutral": bool(row[4]),
+            "source": row[5],
+            "matchDate": row[6],
+        }
+        for row in rows
+    ]
+
+
+def all_completed_matches() -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for match in COMPLETED_MATCHES + completed_matches_from_db():
+        merged[prediction_match_key(match["home"], match["away"])] = match
+    return list(merged.values())
+
+
+def latest_prediction_snapshot(match_key: str, before_ts: int | None = None) -> dict[str, Any] | None:
+    init_search_db()
+    sql = "SELECT payload FROM prediction_snapshots WHERE match_key = ?"
+    params: list[Any] = [match_key]
+    if before_ts:
+        sql += " AND created_at <= ?"
+        params.append(before_ts)
+    sql += " ORDER BY created_at DESC LIMIT 1"
+    with sqlite3.connect(SEARCH_DB_PATH) as conn:
+        row = conn.execute(sql, params).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def tune_model_from_snapshots() -> dict[str, Any]:
+    matches = completed_matches_from_db()
+    if not matches:
+        return {"ok": False, "reason": "暂无自动同步赛果。", "params": model_params()}
+    misses = {"clean_sheet": 0, "draw": 0, "high_score": 0}
+    hits = {"clean_sheet": 0, "draw": 0, "high_score": 0}
+    evaluated = 0
+    for match in matches[-20:]:
+        snapshot = latest_prediction_snapshot(prediction_match_key(match["home"], match["away"]))
+        if not snapshot:
+            continue
+        actual = f'{match["score"][0]}-{match["score"][1]}'
+        top3 = [item["score"] for item in snapshot.get("coverageScores", {}).get("recommendedTop3", [])]
+        evaluated += 1
+        actual_clean = match["score"][0] == 0 or match["score"][1] == 0
+        actual_draw = match["score"][0] == match["score"][1]
+        actual_high = sum(match["score"]) >= 4
+        predicted_clean = any(score.endswith("-0") or score.startswith("0-") for score in top3)
+        predicted_draw = any(score.split("-")[0] == score.split("-")[1] for score in top3 if "-" in score)
+        predicted_high = any(sum(map(int, score.split("-"))) >= 4 for score in top3 if re.fullmatch(r"\d+-\d+", score))
+        for name, actual_flag, predicted_flag in [
+            ("clean_sheet", actual_clean, predicted_clean),
+            ("draw", actual_draw, predicted_draw),
+            ("high_score", actual_high, predicted_high),
+        ]:
+            if actual_flag and not predicted_flag:
+                misses[name] += 1
+            elif actual_flag and predicted_flag:
+                hits[name] += 1
+    params = model_params()
+    if evaluated:
+        updates = dict(params)
+        if misses["clean_sheet"] > hits["clean_sheet"]:
+            updates["clean_sheet_bias"] = min(1.18, params["clean_sheet_bias"] + 0.02)
+        if misses["draw"] > hits["draw"]:
+            updates["draw_bias"] = min(1.18, params["draw_bias"] + 0.02)
+        if misses["high_score"] > hits["high_score"]:
+            updates["high_score_bias"] = min(1.18, params["high_score_bias"] + 0.02)
+        if updates != params:
+            params = update_model_params(updates)
+    return {"ok": True, "evaluated": evaluated, "misses": misses, "hits": hits, "params": params}
 
 
 def normalize_name_for_match(name: str) -> str:
@@ -697,7 +970,7 @@ def matrix_outcome_probs(matrix: list[list[float]]) -> dict[str, float]:
     return {"homeWin": home_win, "draw": draw, "awayWin": away_win}
 
 
-def apply_market_prior(matrix: list[list[float]], market_signal: dict[str, Any]) -> list[list[float]]:
+def apply_market_prior(matrix: list[list[float]], market_signal: dict[str, Any], params: dict[str, float]) -> list[list[float]]:
     if not market_signal.get("ok") or not market_signal.get("implied"):
         return matrix
     implied = market_signal.get("implied") or {}
@@ -706,7 +979,7 @@ def apply_market_prior(matrix: list[list[float]], market_signal: dict[str, Any])
     total = 0.0
     # Market odds are useful but not omniscient. A fractional exponent keeps the
     # model from blindly following crowd price moves.
-    strength = 0.38
+    strength = params.get("market_outcome_strength", DEFAULT_MODEL_PARAMS["market_outcome_strength"])
     for h, row in enumerate(matrix):
         adjusted_row = []
         for a, value in enumerate(row):
@@ -726,7 +999,7 @@ def apply_market_prior(matrix: list[list[float]], market_signal: dict[str, Any])
     return [[value / total for value in row] for row in adjusted]
 
 
-def apply_score_market_prior(matrix: list[list[float]], market_signal: dict[str, Any]) -> list[list[float]]:
+def apply_score_market_prior(matrix: list[list[float]], market_signal: dict[str, Any], params: dict[str, float]) -> list[list[float]]:
     if not market_signal.get("ok"):
         return matrix
     score_odds = (market_signal.get("match") or {}).get("scoreOdds") or {}
@@ -749,7 +1022,7 @@ def apply_score_market_prior(matrix: list[list[float]], market_signal: dict[str,
 
     adjusted = []
     total = 0.0
-    strength = 0.24
+    strength = params.get("score_market_strength", DEFAULT_MODEL_PARAMS["score_market_strength"])
     for h, row in enumerate(matrix):
         adjusted_row = []
         for a, value in enumerate(row):
@@ -798,6 +1071,7 @@ def apply_historical_prior(
     draw: float,
     over25: float,
     btts: float,
+    params: dict[str, float],
 ) -> list[dict[str, Any]]:
     adjusted = []
     for item in all_scores:
@@ -810,11 +1084,13 @@ def apply_historical_prior(
         if is_favorite_win:
             multiplier *= 1.04
         if favorite_prob >= 0.54 and is_favorite_win and is_clean_sheet:
-            multiplier *= 1.10
+            multiplier *= 1.10 * params.get("clean_sheet_bias", 1.0)
+        if candidate["home"] == candidate["away"]:
+            multiplier *= params.get("draw_bias", 1.0)
         if btts >= 0.50 and total_goals >= 3 and candidate["home"] > 0 and candidate["away"] > 0:
             multiplier *= 1.10
         if over25 >= 0.55 and total_goals >= 3:
-            multiplier *= 1.08
+            multiplier *= 1.08 * params.get("high_score_bias", 1.0)
         if over25 < 0.50 and total_goals >= 4:
             multiplier *= 0.72
         if candidate["score"] == "2-2" and draw >= 0.28 and btts >= 0.45 and over25 >= 0.36:
@@ -838,6 +1114,7 @@ def build_coverage_scores(
     draw: float,
     away_win: float,
     market_signal: dict[str, Any] | None = None,
+    params: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     used: set[str] = set()
     recommendations: list[dict[str, Any]] = []
@@ -847,7 +1124,8 @@ def build_coverage_scores(
     favorite_prob = max(home_win, away_win)
     over25 = sum(item["prob"] for item in all_scores if item["home"] + item["away"] >= 3)
     btts = sum(item["prob"] for item in all_scores if item["home"] > 0 and item["away"] > 0)
-    coverage_scores = apply_historical_prior(all_scores, favorite, favorite_prob, draw, over25, btts)
+    params = params or DEFAULT_MODEL_PARAMS
+    coverage_scores = apply_historical_prior(all_scores, favorite, favorite_prob, draw, over25, btts, params)
     market_home_gap = 0.0
     market_draw = 0.0
     if market_signal and market_signal.get("ok"):
@@ -1044,6 +1322,7 @@ def predict(home: str, away: str, neutral: bool, use_web: bool = True) -> dict[s
         valid = "、".join(team["zh"] for team in KNOCKOUT_TEAMS)
         raise ValueError(f"只能选择本届世界杯32强淘汰赛球队。可选：{valid}")
     home_news, away_news, market_signal = collect_live_signals(home_profile, away_profile, use_web)
+    params = model_params()
     home_news_form, home_news_risk = news_adjustment(home_news)
     away_news_form, away_news_risk = news_adjustment(away_news)
 
@@ -1080,8 +1359,9 @@ def predict(home: str, away: str, neutral: bool, use_web: bool = True) -> dict[s
     away_lam = max(0.25, min(4.3, away_lam))
 
     matrix = apply_score_market_prior(
-        apply_market_prior(apply_regulation_time_prior(build_score_matrix(home_lam, away_lam)), market_signal),
+        apply_market_prior(apply_regulation_time_prior(build_score_matrix(home_lam, away_lam)), market_signal, params),
         market_signal,
+        params,
     )
     home_win = draw = away_win = over25 = btts = 0.0
     top_scores = []
@@ -1099,7 +1379,7 @@ def predict(home: str, away: str, neutral: bool, use_web: bool = True) -> dict[s
                 btts += p
             top_scores.append(score_item(h, a, p))
     top_scores.sort(key=lambda item: item["prob"], reverse=True)
-    coverage = build_coverage_scores(top_scores, home_win, draw, away_win, market_signal)
+    coverage = build_coverage_scores(top_scores, home_win, draw, away_win, market_signal, params)
 
     data_points = 2
     data_points += 1 if home_news.get("ok") else 0
@@ -1146,6 +1426,10 @@ def predict(home: str, away: str, neutral: bool, use_web: bool = True) -> dict[s
             ],
         },
         "generatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "model": {
+            "version": APP_VERSION,
+            "params": params,
+        },
     }
 
 
@@ -1165,7 +1449,8 @@ def evaluate_completed_matches() -> dict[str, Any]:
     recommended3_hits = 0
     recommended5_hits = 0
     top10_hits = 0
-    for match in COMPLETED_MATCHES:
+    completed = all_completed_matches()
+    for match in completed:
         result = predict(match["home"], match["away"], match["neutral"], use_web=False)
         probs = result["probabilities"]
         pmap = {"H": probs["homeWin"], "D": probs["draw"], "A": probs["awayWin"]}
@@ -1214,7 +1499,7 @@ def evaluate_completed_matches() -> dict[str, Any]:
                 "top10Hit": top10_hit,
             }
         )
-    total = len(COMPLETED_MATCHES)
+    total = len(completed)
     return {
         "total": total,
         "resultAccuracy": result_hits / total,
@@ -1247,7 +1532,9 @@ def api_predict():
     if home == away:
         return jsonify({"error": "请选择两支不同球队"}), 400
     try:
-        return jsonify(predict(home, away, neutral))
+        result = predict(home, away, neutral)
+        save_prediction_snapshot(result)
+        return jsonify(result)
     except Exception as exc:
         return jsonify({"error": f"预测失败：{exc}"}), 500
 
@@ -1295,6 +1582,52 @@ def api_odds_status():
             "error": payload.get("error", ""),
         }
     )
+
+
+@app.post("/api/results/sync")
+def api_results_sync():
+    token = request.headers.get("X-Results-Sync-Token") or request.headers.get("X-Odds-Sync-Token") or request.args.get("token", "")
+    if token != RESULTS_SYNC_TOKEN:
+        return jsonify({"error": "赛果同步 token 不正确"}), 403
+    payload = request.get_json(silent=True) or {}
+    results = payload.get("results") or []
+    if not isinstance(results, list):
+        return jsonify({"error": "results 必须是数组"}), 400
+    try:
+        imported = import_completed_results(results)
+        tuning = tune_model_from_snapshots()
+        return jsonify(
+            {
+                "ok": imported["ok"],
+                "imported": imported["imported"],
+                "tuning": tuning,
+                "generatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        )
+    except Exception as exc:
+        log_sync_error("results", str(exc))
+        return jsonify({"error": f"赛果同步失败：{exc}"}), 500
+
+
+@app.get("/api/results/status")
+def api_results_status():
+    results = completed_matches_from_db()
+    return jsonify(
+        {
+            "ok": True,
+            "matches": len(results),
+            "sample": results[-8:],
+            "modelParams": model_params(),
+        }
+    )
+
+
+@app.post("/api/model/tune")
+def api_model_tune():
+    token = request.headers.get("X-Results-Sync-Token") or request.headers.get("X-Odds-Sync-Token") or request.args.get("token", "")
+    if token != RESULTS_SYNC_TOKEN:
+        return jsonify({"error": "模型调参 token 不正确"}), 403
+    return jsonify(tune_model_from_snapshots())
 
 
 if __name__ == "__main__":

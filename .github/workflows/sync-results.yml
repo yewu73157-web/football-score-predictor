@@ -1,0 +1,23 @@
+name: Sync results and tune model
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+jobs:
+  sync-results:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install requests
+        run: python -m pip install requests
+      - name: Sync completed World Cup results
+        env:
+          RESULTS_SYNC_URL: ${{ vars.RESULTS_SYNC_URL || 'https://gongwenjie.pythonanywhere.com/api/results/sync' }}
+          RESULTS_SYNC_TOKEN: ${{ secrets.RESULTS_SYNC_TOKEN || secrets.ODDS_SYNC_TOKEN || 'football-score-odds-sync-2026' }}
+        run: python scripts/sync_results.py

@@ -72,25 +72,30 @@ def main() -> int:
     sync_url = os.environ.get("ODDS_SYNC_URL", DEFAULT_SYNC_URL)
     sync_token = os.environ.get("ODDS_SYNC_TOKEN", DEFAULT_SYNC_TOKEN)
 
-    response = requests.get(SPORTTERY_ODDS_URL, headers=HEADERS, timeout=20)
-    response.raise_for_status()
-    sporttery_payload = response.json()
-    if not sporttery_payload.get("success"):
-        raise RuntimeError(sporttery_payload.get("errorMessage") or "Sporttery odds request failed")
+    try:
+        response = requests.get(SPORTTERY_ODDS_URL, headers=HEADERS, timeout=20)
+        response.raise_for_status()
+        sporttery_payload = response.json()
+        if not sporttery_payload.get("success"):
+            raise RuntimeError(sporttery_payload.get("errorMessage") or "Sporttery odds request failed")
 
-    matches = flatten_sporttery_matches(sporttery_payload)
-    if not matches:
-        raise RuntimeError("No usable odds returned from Sporttery")
+        matches = flatten_sporttery_matches(sporttery_payload)
+        if not matches:
+            print("No usable odds returned from Sporttery; keeping existing site cache.")
+            return 0
 
-    sync_response = requests.post(
-        sync_url,
-        headers={"X-Odds-Sync-Token": sync_token, "Content-Type": "application/json"},
-        data=json.dumps({"matches": matches}, ensure_ascii=False).encode("utf-8"),
-        timeout=20,
-    )
-    print(sync_response.status_code)
-    print(sync_response.text[:1000])
-    sync_response.raise_for_status()
+        sync_response = requests.post(
+            sync_url,
+            headers={"X-Odds-Sync-Token": sync_token, "Content-Type": "application/json"},
+            data=json.dumps({"matches": matches}, ensure_ascii=False).encode("utf-8"),
+            timeout=20,
+        )
+        print(sync_response.status_code)
+        print(sync_response.text[:1000])
+        sync_response.raise_for_status()
+    except Exception as exc:
+        print(f"Odds sync skipped; existing cache remains active. Error: {exc}")
+        return 0
     return 0
 
 

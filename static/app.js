@@ -111,9 +111,16 @@ function renderSources(data) {
   const market = data.sources.marketSignal || {};
   const marketMatch = market.match || {};
   const odds = marketMatch.odds || {};
+  const scoreOdds = marketMatch.scoreOdds || {};
   const implied = market.implied || {};
+  const scoreOddsText = Object.keys(scoreOdds).length
+    ? Object.entries(scoreOdds)
+        .slice(0, 12)
+        .map(([score, value]) => `${score}:${value}`)
+        .join("，")
+    : "暂无比分赔率";
   const marketText = market.ok
-    ? `${marketMatch.homeTeam} vs ${marketMatch.awayTeam}，胜/平/负赔率 ${odds.home} / ${odds.draw} / ${odds.away}；隐含概率 ${pct(implied.homeWin)} / ${pct(implied.draw)} / ${pct(implied.awayWin)}。${cacheText(market)}`
+    ? `${marketMatch.homeTeam} vs ${marketMatch.awayTeam}，胜/平/负赔率 ${odds.home || "-"} / ${odds.draw || "-"} / ${odds.away || "-"}；${implied.homeWin ? `隐含概率 ${pct(implied.homeWin)} / ${pct(implied.draw)} / ${pct(implied.awayWin)}。` : ""}比分赔率：${scoreOddsText}。${cacheText(market)}`
     : `${market.reason || "未匹配到竞彩赔率"}${market.error ? `：${market.error}` : ""}`;
   sourceSummary.innerHTML = `
     <div class="source-card">

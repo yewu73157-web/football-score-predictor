@@ -17,16 +17,16 @@ from flask import Flask, jsonify, render_template, request
 
 
 app = Flask(__name__)
-APP_VERSION = "20260703-auto-odds-sync1"
+APP_VERSION = "20260703-score-odds-sync1"
 SEARCH_CACHE_TTL_SECONDS = int(os.environ.get("SEARCH_CACHE_TTL_SECONDS", str(24 * 60 * 60)))
 ODDS_CACHE_TTL_SECONDS = int(os.environ.get("ODDS_CACHE_TTL_SECONDS", str(30 * 60)))
 ODDS_SYNC_TOKEN = os.environ.get("ODDS_SYNC_TOKEN", "football-score-odds-sync-2026")
 SEARCH_DB_PATH = os.environ.get("SEARCH_DB_PATH", os.path.join(app.root_path, "data", "web_signals.sqlite3"))
-SPORTTERY_ODDS_URL = "https://webapi.sporttery.cn/gateway/uniform/football/getMatchCalculatorV1.qry?channel=m&poolCode=had"
+SPORTTERY_ODDS_URL = "https://webapi.sporttery.cn/gateway/uniform/football/getMatchCalculatorV1.qry?channel=m&poolCode=had,crs"
 
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 football-score-predictor/1.0 (local analytics app)",
-    "Referer": "https://m.sporttery.cn/mjc/jsq/zqspf/",
+    "Referer": "https://m.sporttery.cn/mjc/jsq/zqbf/",
     "Accept": "application/json,text/plain,*/*",
 }
 
@@ -309,11 +309,34 @@ def normalize_name_for_match(name: str) -> str:
     return re.sub(r"[\s·（）()队]", "", clean_team_name(name)).lower()
 
 
+def parse_score_odds(crs: dict[str, Any]) -> dict[str, float]:
+    score_odds: dict[str, float] = {}
+    for key, raw_value in (crs or {}).items():
+        if key.endswith("f"):
+            continue
+        match = re.fullmatch(r"s(\d{2})s(\d{2})", key)
+        if not match:
+            continue
+        try:
+            score_odds[f"{int(match.group(1))}-{int(match.group(2))}"] = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+    other_labels = {"s1sh": "胜其他", "s1sd": "平其他", "s1sa": "负其他"}
+    for key, label in other_labels.items():
+        try:
+            score_odds[label] = float(crs[key])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return score_odds
+
+
 def flatten_sporttery_matches(payload: dict[str, Any]) -> list[dict[str, Any]]:
     matches = []
     for date_group in payload.get("value", {}).get("matchInfoList", []):
         for match in date_group.get("subMatchList", []):
             had = match.get("had") or {}
+            crs = match.get("crs") or {}
+            score_odds = parse_score_odds(crs)
             try:
                 odds = {
                     "home": float(had["h"]),
@@ -321,6 +344,8 @@ def flatten_sporttery_matches(payload: dict[str, Any]) -> list[dict[str, Any]]:
                     "away": float(had["a"]),
                 }
             except (KeyError, TypeError, ValueError):
+                odds = {}
+            if not odds and not score_odds:
                 continue
             matches.append(
                 {
@@ -332,7 +357,9 @@ def flatten_sporttery_matches(payload: dict[str, Any]) -> list[dict[str, Any]]:
                     "homeTeam": match.get("homeTeamAllName") or match.get("homeTeamAbbName", ""),
                     "awayTeam": match.get("awayTeamAllName") or match.get("awayTeamAbbName", ""),
                     "odds": odds,
+                    "scoreOdds": score_odds,
                     "updatedAt": f"{had.get('updateDate', '')} {had.get('updateTime', '')}".strip(),
+                    "scoreUpdatedAt": f"{crs.get('updateDate', '')} {crs.get('updateTime', '')}".strip(),
                 }
             )
     return matches
@@ -350,8 +377,8 @@ def fetch_sporttery_odds() -> dict[str, Any]:
             raise ValueError(payload.get("errorMessage") or "竞彩赔率接口返回失败")
         odds_payload = {
             "ok": True,
-            "source": "中国体育彩票胜平负公开赔率",
-            "url": "https://m.sporttery.cn/mjc/jsq/zqspf/",
+            "source": "中国体育彩票胜平负与比分公开赔率",
+            "url": "https://m.sporttery.cn/mjc/jsq/zqbf/",
             "matches": flatten_sporttery_matches(payload),
             "error": "",
             "cache": {"hit": False, "ageSeconds": 0, "ttlSeconds": ODDS_CACHE_TTL_SECONDS},
@@ -363,8 +390,8 @@ def fetch_sporttery_odds() -> dict[str, Any]:
             return stale
         odds_payload = {
             "ok": False,
-            "source": "中国体育彩票胜平负公开赔率",
-            "url": "https://m.sporttery.cn/mjc/jsq/zqspf/",
+            "source": "中国体育彩票胜平负与比分公开赔率",
+            "url": "https://m.sporttery.cn/mjc/jsq/zqbf/",
             "matches": [],
             "error": str(exc),
             "cache": {"hit": False, "ageSeconds": 0, "ttlSeconds": ODDS_CACHE_TTL_SECONDS},
@@ -377,6 +404,23 @@ def import_sporttery_odds(matches: list[dict[str, Any]], source: str = "GitHub A
     cleaned_matches = []
     for match in matches:
         odds = match.get("odds") or {}
+        score_odds = match.get("scoreOdds") or {}
+        cleaned_score_odds = {}
+        for score, value in score_odds.items():
+            try:
+                cleaned_score_odds[str(score)] = float(value)
+            except (TypeError, ValueError):
+                continue
+        try:
+            cleaned_odds = {
+                "home": float(odds["home"]),
+                "draw": float(odds["draw"]),
+                "away": float(odds["away"]),
+            }
+        except (KeyError, TypeError, ValueError):
+            cleaned_odds = {}
+        if not cleaned_odds and not cleaned_score_odds:
+            continue
         try:
             cleaned_matches.append(
                 {
@@ -387,20 +431,18 @@ def import_sporttery_odds(matches: list[dict[str, Any]], source: str = "GitHub A
                     "matchTime": str(match.get("matchTime", "")),
                     "homeTeam": str(match.get("homeTeam", "")),
                     "awayTeam": str(match.get("awayTeam", "")),
-                    "odds": {
-                        "home": float(odds["home"]),
-                        "draw": float(odds["draw"]),
-                        "away": float(odds["away"]),
-                    },
+                    "odds": cleaned_odds,
+                    "scoreOdds": cleaned_score_odds,
                     "updatedAt": str(match.get("updatedAt", "")),
+                    "scoreUpdatedAt": str(match.get("scoreUpdatedAt", "")),
                 }
             )
-        except (KeyError, TypeError, ValueError):
+        except (TypeError, ValueError):
             continue
     payload = {
         "ok": bool(cleaned_matches),
         "source": source,
-        "url": "https://m.sporttery.cn/mjc/jsq/zqspf/",
+        "url": "https://m.sporttery.cn/mjc/jsq/zqbf/",
         "matches": cleaned_matches,
         "error": "" if cleaned_matches else "同步数据中没有可用赔率。",
         "cache": {"hit": False, "ageSeconds": 0, "ttlSeconds": ODDS_CACHE_TTL_SECONDS},
@@ -410,6 +452,8 @@ def import_sporttery_odds(matches: list[dict[str, Any]], source: str = "GitHub A
 
 
 def implied_market_probs(odds: dict[str, float]) -> dict[str, float]:
+    if not {"home", "draw", "away"}.issubset(odds):
+        return {}
     inv_home = 1 / odds["home"]
     inv_draw = 1 / odds["draw"]
     inv_away = 1 / odds["away"]
@@ -433,19 +477,34 @@ def find_market_signal(home_profile: TeamProfile, away_profile: TeamProfile, use
                 "source": payload.get("source"),
                 "url": payload.get("url"),
                 "match": match,
-                "implied": implied_market_probs(match["odds"]),
+                "implied": implied_market_probs(match.get("odds") or {}),
                 "cache": payload.get("cache"),
             }
         if home_key in market_away and away_key in market_home:
-            reversed_odds = {
-                "home": match["odds"]["away"],
-                "draw": match["odds"]["draw"],
-                "away": match["odds"]["home"],
-            }
+            raw_odds = match.get("odds") or {}
+            reversed_odds = {}
+            if {"home", "draw", "away"}.issubset(raw_odds):
+                reversed_odds = {
+                    "home": raw_odds["away"],
+                    "draw": raw_odds["draw"],
+                    "away": raw_odds["home"],
+                }
+            reversed_score_odds = {}
+            for score, value in (match.get("scoreOdds") or {}).items():
+                score_match = re.fullmatch(r"(\d+)-(\d+)", score)
+                if score_match:
+                    reversed_score_odds[f"{int(score_match.group(2))}-{int(score_match.group(1))}"] = value
+                elif score == "胜其他":
+                    reversed_score_odds["负其他"] = value
+                elif score == "负其他":
+                    reversed_score_odds["胜其他"] = value
+                else:
+                    reversed_score_odds[score] = value
             reversed_match = dict(match)
             reversed_match["homeTeam"] = match["awayTeam"]
             reversed_match["awayTeam"] = match["homeTeam"]
             reversed_match["odds"] = reversed_odds
+            reversed_match["scoreOdds"] = reversed_score_odds
             return {
                 "ok": True,
                 "used": True,
@@ -639,7 +698,7 @@ def matrix_outcome_probs(matrix: list[list[float]]) -> dict[str, float]:
 
 
 def apply_market_prior(matrix: list[list[float]], market_signal: dict[str, Any]) -> list[list[float]]:
-    if not market_signal.get("ok"):
+    if not market_signal.get("ok") or not market_signal.get("implied"):
         return matrix
     implied = market_signal.get("implied") or {}
     model = matrix_outcome_probs(matrix)
@@ -660,6 +719,47 @@ def apply_market_prior(matrix: list[list[float]], market_signal: dict[str, Any])
             market_prob = max(0.01, float(implied.get(key, model[key])))
             model_prob = max(0.01, model[key])
             multiplier = (market_prob / model_prob) ** strength
+            adjusted_value = value * multiplier
+            adjusted_row.append(adjusted_value)
+            total += adjusted_value
+        adjusted.append(adjusted_row)
+    return [[value / total for value in row] for row in adjusted]
+
+
+def apply_score_market_prior(matrix: list[list[float]], market_signal: dict[str, Any]) -> list[list[float]]:
+    if not market_signal.get("ok"):
+        return matrix
+    score_odds = (market_signal.get("match") or {}).get("scoreOdds") or {}
+    exact_score_odds = {}
+    for score, odds in score_odds.items():
+        score_match = re.fullmatch(r"(\d+)-(\d+)", score)
+        if not score_match:
+            continue
+        h = int(score_match.group(1))
+        a = int(score_match.group(2))
+        if h < len(matrix) and a < len(matrix[h]) and odds > 0:
+            exact_score_odds[(h, a)] = float(odds)
+    if len(exact_score_odds) < 5:
+        return matrix
+
+    market_inv_total = sum(1 / odds for odds in exact_score_odds.values())
+    model_subset_total = sum(matrix[h][a] for h, a in exact_score_odds)
+    if market_inv_total <= 0 or model_subset_total <= 0:
+        return matrix
+
+    adjusted = []
+    total = 0.0
+    strength = 0.24
+    for h, row in enumerate(matrix):
+        adjusted_row = []
+        for a, value in enumerate(row):
+            score_key = (h, a)
+            if score_key in exact_score_odds:
+                market_prob = (1 / exact_score_odds[score_key]) / market_inv_total
+                model_prob = value / model_subset_total
+                multiplier = (max(0.001, market_prob) / max(0.001, model_prob)) ** strength
+            else:
+                multiplier = 1.0
             adjusted_value = value * multiplier
             adjusted_row.append(adjusted_value)
             total += adjusted_value
@@ -979,7 +1079,10 @@ def predict(home: str, away: str, neutral: bool, use_web: bool = True) -> dict[s
     home_lam = max(0.25, min(4.3, home_lam))
     away_lam = max(0.25, min(4.3, away_lam))
 
-    matrix = apply_market_prior(apply_regulation_time_prior(build_score_matrix(home_lam, away_lam)), market_signal)
+    matrix = apply_score_market_prior(
+        apply_market_prior(apply_regulation_time_prior(build_score_matrix(home_lam, away_lam)), market_signal),
+        market_signal,
+    )
     home_win = draw = away_win = over25 = btts = 0.0
     top_scores = []
     for h, row in enumerate(matrix):

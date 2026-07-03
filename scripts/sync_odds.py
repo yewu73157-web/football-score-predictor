@@ -14,9 +14,10 @@ DEFAULT_SYNC_TOKEN = "football-score-odds-sync-2026"
 
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 football-score-predictor/1.0",
+    "User-Agent": "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/126 Mobile Safari/537.36",
     "Referer": "https://m.sporttery.cn/mjc/jsq/zqbf/",
     "Accept": "application/json,text/plain,*/*",
+    "Origin": "https://m.sporttery.cn",
 }
 
 

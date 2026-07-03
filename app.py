@@ -34,9 +34,10 @@ DEFAULT_MODEL_PARAMS = {
 }
 
 HTTP_HEADERS = {
-    "User-Agent": "Mozilla/5.0 football-score-predictor/1.0 (local analytics app)",
+    "User-Agent": "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/126 Mobile Safari/537.36",
     "Referer": "https://m.sporttery.cn/mjc/jsq/zqbf/",
     "Accept": "application/json,text/plain,*/*",
+    "Origin": "https://m.sporttery.cn",
 }
 
 KNOCKOUT_TEAMS = [

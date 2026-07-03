@@ -4,10 +4,15 @@ services:
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 45
+    healthCheckPath: /healthz
     autoDeploy: true
     envVars:
       - key: FOOTBALL_HOST
         value: 0.0.0.0
       - key: FOOTBALL_DEBUG
         value: "0"
+      - key: SEARCH_CACHE_TTL_SECONDS
+        value: "86400"
+      - key: ODDS_CACHE_TTL_SECONDS
+        value: "1800"

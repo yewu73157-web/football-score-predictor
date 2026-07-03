@@ -6,6 +6,7 @@ import re
 import json
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass
 from difflib import get_close_matches
 from typing import Any
@@ -16,7 +17,7 @@ from flask import Flask, jsonify, render_template, request
 
 
 app = Flask(__name__)
-APP_VERSION = "20260702-sporttery-odds1"
+APP_VERSION = "20260703-render-live-odds1"
 SEARCH_CACHE_TTL_SECONDS = int(os.environ.get("SEARCH_CACHE_TTL_SECONDS", str(24 * 60 * 60)))
 ODDS_CACHE_TTL_SECONDS = int(os.environ.get("ODDS_CACHE_TTL_SECONDS", str(30 * 60)))
 SEARCH_DB_PATH = os.environ.get("SEARCH_DB_PATH", os.path.join(app.root_path, "data", "web_signals.sqlite3"))
@@ -341,7 +342,7 @@ def fetch_sporttery_odds() -> dict[str, Any]:
     if cached:
         return cached
     try:
-        response = requests.get(SPORTTERY_ODDS_URL, headers=HTTP_HEADERS, timeout=3)
+        response = requests.get(SPORTTERY_ODDS_URL, headers=HTTP_HEADERS, timeout=2.5)
         response.raise_for_status()
         payload = response.json()
         if not payload.get("success"):
@@ -452,7 +453,7 @@ def search_web_signals(team: str) -> dict[str, Any]:
     query = f"{search_name} World Cup 2026 injuries lineup recent form knockout"
     url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
     try:
-        html = http_get(url, timeout=3)
+        html = http_get(url, timeout=2.5)
     except Exception as exc:
         stale = read_cached_web_signals(team_key, allow_expired=True)
         if stale:
@@ -864,19 +865,48 @@ def news_adjustment(news: dict[str, Any]) -> tuple[float, float]:
     return news.get("form", 0.0), news.get("risk", 0.0)
 
 
+def collect_live_signals(
+    home_profile: TeamProfile,
+    away_profile: TeamProfile,
+    use_web: bool,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    if not use_web:
+        return (
+            offline_web_signals(home_profile.zh),
+            offline_web_signals(away_profile.zh),
+            find_market_signal(home_profile, away_profile, use_market=False),
+        )
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {
+            "home": executor.submit(search_web_signals, home_profile.zh),
+            "away": executor.submit(search_web_signals, away_profile.zh),
+            "market": executor.submit(find_market_signal, home_profile, away_profile, True),
+        }
+        try:
+            home_news = futures["home"].result(timeout=3.2)
+        except TimeoutError:
+            home_news = offline_web_signals(home_profile.zh)
+            home_news["error"] = "联网搜索超时，已跳过本场主队新闻修正。"
+        try:
+            away_news = futures["away"].result(timeout=3.2)
+        except TimeoutError:
+            away_news = offline_web_signals(away_profile.zh)
+            away_news["error"] = "联网搜索超时，已跳过本场客队新闻修正。"
+        try:
+            market_signal = futures["market"].result(timeout=3.2)
+        except TimeoutError:
+            market_signal = {"ok": False, "used": False, "reason": "竞彩赔率读取超时，已跳过市场校准。"}
+    return home_news, away_news, market_signal
+
+
 def predict(home: str, away: str, neutral: bool, use_web: bool = True) -> dict[str, Any]:
     home_profile = resolve_team(home)
     away_profile = resolve_team(away)
     if not home_profile or not away_profile:
         valid = "、".join(team["zh"] for team in KNOCKOUT_TEAMS)
         raise ValueError(f"只能选择本届世界杯32强淘汰赛球队。可选：{valid}")
-    if use_web:
-        home_news = search_web_signals(home)
-        away_news = search_web_signals(away)
-    else:
-        home_news = offline_web_signals(home)
-        away_news = offline_web_signals(away)
-    market_signal = find_market_signal(home_profile, away_profile, use_market=use_web)
+    home_news, away_news, market_signal = collect_live_signals(home_profile, away_profile, use_web)
     home_news_form, home_news_risk = news_adjustment(home_news)
     away_news_form, away_news_risk = news_adjustment(away_news)
 
@@ -1060,6 +1090,11 @@ def evaluate_completed_matches() -> dict[str, Any]:
 @app.get("/")
 def index():
     return render_template("index.html", teams=KNOCKOUT_TEAMS, app_version=APP_VERSION)
+
+
+@app.get("/healthz")
+def healthz():
+    return jsonify({"ok": True, "version": APP_VERSION})
 
 
 @app.get("/api/predict")

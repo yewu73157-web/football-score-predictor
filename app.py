@@ -17,9 +17,10 @@ from flask import Flask, jsonify, render_template, request
 
 
 app = Flask(__name__)
-APP_VERSION = "20260703-render-live-odds1"
+APP_VERSION = "20260703-auto-odds-sync1"
 SEARCH_CACHE_TTL_SECONDS = int(os.environ.get("SEARCH_CACHE_TTL_SECONDS", str(24 * 60 * 60)))
 ODDS_CACHE_TTL_SECONDS = int(os.environ.get("ODDS_CACHE_TTL_SECONDS", str(30 * 60)))
+ODDS_SYNC_TOKEN = os.environ.get("ODDS_SYNC_TOKEN", "football-score-odds-sync-2026")
 SEARCH_DB_PATH = os.environ.get("SEARCH_DB_PATH", os.path.join(app.root_path, "data", "web_signals.sqlite3"))
 SPORTTERY_ODDS_URL = "https://webapi.sporttery.cn/gateway/uniform/football/getMatchCalculatorV1.qry?channel=m&poolCode=had"
 
@@ -370,6 +371,42 @@ def fetch_sporttery_odds() -> dict[str, Any]:
         }
     write_cached_odds(odds_payload)
     return odds_payload
+
+
+def import_sporttery_odds(matches: list[dict[str, Any]], source: str = "GitHub Actions 自动同步竞彩赔率") -> dict[str, Any]:
+    cleaned_matches = []
+    for match in matches:
+        odds = match.get("odds") or {}
+        try:
+            cleaned_matches.append(
+                {
+                    "matchId": str(match.get("matchId", "")),
+                    "matchNum": str(match.get("matchNum", "")),
+                    "league": str(match.get("league", "")),
+                    "matchDate": str(match.get("matchDate", "")),
+                    "matchTime": str(match.get("matchTime", "")),
+                    "homeTeam": str(match.get("homeTeam", "")),
+                    "awayTeam": str(match.get("awayTeam", "")),
+                    "odds": {
+                        "home": float(odds["home"]),
+                        "draw": float(odds["draw"]),
+                        "away": float(odds["away"]),
+                    },
+                    "updatedAt": str(match.get("updatedAt", "")),
+                }
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    payload = {
+        "ok": bool(cleaned_matches),
+        "source": source,
+        "url": "https://m.sporttery.cn/mjc/jsq/zqspf/",
+        "matches": cleaned_matches,
+        "error": "" if cleaned_matches else "同步数据中没有可用赔率。",
+        "cache": {"hit": False, "ageSeconds": 0, "ttlSeconds": ODDS_CACHE_TTL_SECONDS},
+    }
+    write_cached_odds(payload)
+    return payload
 
 
 def implied_market_probs(odds: dict[str, float]) -> dict[str, float]:
@@ -1118,6 +1155,43 @@ def api_backtest():
         return jsonify(evaluate_completed_matches())
     except Exception as exc:
         return jsonify({"error": f"回测失败：{exc}"}), 500
+
+
+@app.post("/api/odds/sync")
+def api_odds_sync():
+    token = request.headers.get("X-Odds-Sync-Token") or request.args.get("token", "")
+    if token != ODDS_SYNC_TOKEN:
+        return jsonify({"error": "赔率同步 token 不正确"}), 403
+    payload = request.get_json(silent=True) or {}
+    matches = payload.get("matches") or []
+    if not isinstance(matches, list):
+        return jsonify({"error": "matches 必须是数组"}), 400
+    result = import_sporttery_odds(matches)
+    return jsonify(
+        {
+            "ok": result["ok"],
+            "imported": len(result["matches"]),
+            "source": result["source"],
+            "generatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    )
+
+
+@app.get("/api/odds/status")
+def api_odds_status():
+    payload = read_cached_odds(allow_expired=True)
+    if not payload:
+        return jsonify({"ok": False, "matches": 0, "error": "暂无赔率缓存"})
+    return jsonify(
+        {
+            "ok": payload.get("ok", False),
+            "source": payload.get("source", ""),
+            "matches": len(payload.get("matches", [])),
+            "cache": payload.get("cache", {}),
+            "sample": payload.get("matches", [])[:5],
+            "error": payload.get("error", ""),
+        }
+    )
 
 
 if __name__ == "__main__":

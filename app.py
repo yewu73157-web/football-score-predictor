@@ -17,7 +17,7 @@ from flask import Flask, jsonify, render_template, request
 
 
 app = Flask(__name__)
-APP_VERSION = "20260703-auto-learning1"
+APP_VERSION = "20260704-odds-trend1"
 SEARCH_CACHE_TTL_SECONDS = int(os.environ.get("SEARCH_CACHE_TTL_SECONDS", str(24 * 60 * 60)))
 ODDS_CACHE_TTL_SECONDS = int(os.environ.get("ODDS_CACHE_TTL_SECONDS", str(30 * 60)))
 ODDS_SYNC_TOKEN = os.environ.get("ODDS_SYNC_TOKEN", "football-score-odds-sync-2026")
@@ -539,6 +539,106 @@ def latest_prediction_snapshot(match_key: str, before_ts: int | None = None) -> 
     return json.loads(row[0]) if row else None
 
 
+def normalized_market_pair(match: dict[str, Any]) -> tuple[str, str]:
+    return (
+        normalize_name_for_match(match.get("homeTeam", "")),
+        normalize_name_for_match(match.get("awayTeam", "")),
+    )
+
+
+def find_match_in_odds_payload(payload: dict[str, Any], home_key: str, away_key: str) -> tuple[dict[str, Any] | None, bool]:
+    for match in payload.get("matches", []):
+        market_home, market_away = normalized_market_pair(match)
+        if home_key in market_home and away_key in market_away:
+            return match, False
+        if home_key in market_away and away_key in market_home:
+            return match, True
+    return None, False
+
+
+def reverse_score_odds(score_odds: dict[str, Any]) -> dict[str, Any]:
+    reversed_score_odds = {}
+    for score, value in (score_odds or {}).items():
+        score_match = re.fullmatch(r"(\d+)-(\d+)", score)
+        if score_match:
+            reversed_score_odds[f"{int(score_match.group(2))}-{int(score_match.group(1))}"] = value
+        elif score == "胜其他":
+            reversed_score_odds["负其他"] = value
+        elif score == "负其他":
+            reversed_score_odds["胜其他"] = value
+        else:
+            reversed_score_odds[score] = value
+    return reversed_score_odds
+
+
+def odds_trend_for_match(home_profile: TeamProfile, away_profile: TeamProfile) -> dict[str, Any]:
+    home_key = normalize_name_for_match(home_profile.zh)
+    away_key = normalize_name_for_match(away_profile.zh)
+    init_search_db()
+    with sqlite3.connect(SEARCH_DB_PATH) as conn:
+        rows = conn.execute(
+            """
+            SELECT payload, fetched_at
+            FROM odds_snapshots
+            ORDER BY fetched_at DESC
+            LIMIT 8
+            """
+        ).fetchall()
+    if len(rows) < 2:
+        return {"ok": False, "reason": "赔率快照不足，暂不能计算趋势。"}
+
+    observations = []
+    for payload_text, fetched_at in rows:
+        try:
+            payload = json.loads(payload_text)
+        except json.JSONDecodeError:
+            continue
+        match, reversed_side = find_match_in_odds_payload(payload, home_key, away_key)
+        if not match:
+            continue
+        score_odds = match.get("scoreOdds") or {}
+        if reversed_side:
+            score_odds = reverse_score_odds(score_odds)
+        observations.append({"scoreOdds": score_odds, "fetchedAt": int(fetched_at)})
+    if len(observations) < 2:
+        return {"ok": False, "reason": "这场比赛的赔率历史不足。"}
+
+    latest = observations[0]
+    baseline = observations[-1]
+    score_trends = {}
+    for score, current_raw in (latest.get("scoreOdds") or {}).items():
+        if not re.fullmatch(r"\d+-\d+", score):
+            continue
+        try:
+            current = float(current_raw)
+            previous = float((baseline.get("scoreOdds") or {}).get(score))
+        except (TypeError, ValueError):
+            continue
+        if current <= 0 or previous <= 0:
+            continue
+        change = (previous - current) / previous
+        if abs(change) >= 0.035:
+            score_trends[score] = {
+                "previous": previous,
+                "current": current,
+                "changePct": change,
+                "direction": "降赔升温" if change > 0 else "升赔降温",
+            }
+    hot_scores = sorted(
+        ((score, item) for score, item in score_trends.items() if item["changePct"] > 0),
+        key=lambda pair: pair[1]["changePct"],
+        reverse=True,
+    )[:5]
+    return {
+        "ok": bool(score_trends),
+        "snapshotCount": len(observations),
+        "windowSeconds": max(0, latest["fetchedAt"] - baseline["fetchedAt"]),
+        "scores": score_trends,
+        "hotScores": [{"score": score, **item} for score, item in hot_scores],
+        "reason": "" if score_trends else "比分赔率变化未达到阈值。",
+    }
+
+
 def tune_model_from_snapshots() -> dict[str, Any]:
     matches = completed_matches_from_db()
     if not matches:
@@ -769,53 +869,29 @@ def find_market_signal(home_profile: TeamProfile, away_profile: TeamProfile, use
     payload = fetch_sporttery_odds()
     home_key = normalize_name_for_match(home_profile.zh)
     away_key = normalize_name_for_match(away_profile.zh)
-    for match in payload.get("matches", []):
-        market_home = normalize_name_for_match(match.get("homeTeam", ""))
-        market_away = normalize_name_for_match(match.get("awayTeam", ""))
-        if home_key in market_home and away_key in market_away:
-            return {
-                "ok": True,
-                "used": True,
-                "source": payload.get("source"),
-                "url": payload.get("url"),
-                "match": match,
-                "implied": implied_market_probs(match.get("odds") or {}),
-                "cache": payload.get("cache"),
-            }
-        if home_key in market_away and away_key in market_home:
-            raw_odds = match.get("odds") or {}
+    match, reversed_side = find_match_in_odds_payload(payload, home_key, away_key)
+    if match:
+        market_match = dict(match)
+        odds = market_match.get("odds") or {}
+        if reversed_side:
             reversed_odds = {}
-            if {"home", "draw", "away"}.issubset(raw_odds):
-                reversed_odds = {
-                    "home": raw_odds["away"],
-                    "draw": raw_odds["draw"],
-                    "away": raw_odds["home"],
-                }
-            reversed_score_odds = {}
-            for score, value in (match.get("scoreOdds") or {}).items():
-                score_match = re.fullmatch(r"(\d+)-(\d+)", score)
-                if score_match:
-                    reversed_score_odds[f"{int(score_match.group(2))}-{int(score_match.group(1))}"] = value
-                elif score == "胜其他":
-                    reversed_score_odds["负其他"] = value
-                elif score == "负其他":
-                    reversed_score_odds["胜其他"] = value
-                else:
-                    reversed_score_odds[score] = value
-            reversed_match = dict(match)
-            reversed_match["homeTeam"] = match["awayTeam"]
-            reversed_match["awayTeam"] = match["homeTeam"]
-            reversed_match["odds"] = reversed_odds
-            reversed_match["scoreOdds"] = reversed_score_odds
-            return {
-                "ok": True,
-                "used": True,
-                "source": payload.get("source"),
-                "url": payload.get("url"),
-                "match": reversed_match,
-                "implied": implied_market_probs(reversed_odds),
-                "cache": payload.get("cache"),
-            }
+            if {"home", "draw", "away"}.issubset(odds):
+                reversed_odds = {"home": odds["away"], "draw": odds["draw"], "away": odds["home"]}
+            market_match["homeTeam"] = match.get("awayTeam", "")
+            market_match["awayTeam"] = match.get("homeTeam", "")
+            market_match["odds"] = reversed_odds
+            market_match["scoreOdds"] = reverse_score_odds(match.get("scoreOdds") or {})
+            odds = reversed_odds
+        return {
+            "ok": True,
+            "used": True,
+            "source": payload.get("source"),
+            "url": payload.get("url"),
+            "match": market_match,
+            "implied": implied_market_probs(odds),
+            "trend": odds_trend_for_match(home_profile, away_profile),
+            "cache": payload.get("cache"),
+        }
     return {
         "ok": False,
         "used": False,
@@ -1032,6 +1108,7 @@ def apply_score_market_prior(matrix: list[list[float]], market_signal: dict[str,
     if not market_signal.get("ok"):
         return matrix
     score_odds = (market_signal.get("match") or {}).get("scoreOdds") or {}
+    score_trends = ((market_signal.get("trend") or {}).get("scores") or {})
     exact_score_odds = {}
     for score, odds in score_odds.items():
         score_match = re.fullmatch(r"(\d+)-(\d+)", score)
@@ -1062,6 +1139,13 @@ def apply_score_market_prior(matrix: list[list[float]], market_signal: dict[str,
                 multiplier = (max(0.001, market_prob) / max(0.001, model_prob)) ** strength
             else:
                 multiplier = 1.0
+            trend_item = score_trends.get(f"{h}-{a}")
+            if trend_item:
+                change_pct = max(-0.18, min(0.18, float(trend_item.get("changePct", 0.0))))
+                if change_pct > 0:
+                    multiplier *= 1 + change_pct * 0.55
+                else:
+                    multiplier *= 1 + change_pct * 0.28
             adjusted_value = value * multiplier
             adjusted_row.append(adjusted_value)
             total += adjusted_value
@@ -1486,7 +1570,10 @@ def evaluate_completed_matches() -> dict[str, Any]:
     top10_hits = 0
     completed = all_completed_matches()
     for match in completed:
-        result = predict(match["home"], match["away"], match["neutral"], use_web=False)
+        match_key = prediction_match_key(match["home"], match["away"])
+        snapshot = latest_prediction_snapshot(match_key)
+        result = snapshot or predict(match["home"], match["away"], match["neutral"], use_web=False)
+        evaluation_source = "预测快照" if snapshot else "离线重算"
         probs = result["probabilities"]
         pmap = {"H": probs["homeWin"], "D": probs["draw"], "A": probs["awayWin"]}
         predicted_outcome = max(pmap, key=pmap.get)
@@ -1532,6 +1619,7 @@ def evaluate_completed_matches() -> dict[str, Any]:
                 "recommendedTop3Hit": recommended3_hit,
                 "recommendedTop5Hit": recommended5_hit,
                 "top10Hit": top10_hit,
+                "evaluationSource": evaluation_source,
             }
         )
     total = len(completed)

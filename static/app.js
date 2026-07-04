@@ -105,6 +105,11 @@ function cacheText(signal) {
   return `${cache.stale ? "使用过期数据库缓存" : "数据库缓存命中"}，约 ${minutes} 分钟前更新`;
 }
 
+function fixedParam(params, name, fallback = 1) {
+  const value = Number(params[name]);
+  return Number.isFinite(value) ? value.toFixed(3) : fallback.toFixed(3);
+}
+
 function renderSources(data) {
   const [homeProfile, awayProfile] = data.sources.profiles;
   const [homeNews, awayNews] = data.sources.webSignals;
@@ -113,6 +118,17 @@ function renderSources(data) {
   const odds = marketMatch.odds || {};
   const scoreOdds = marketMatch.scoreOdds || {};
   const implied = market.implied || {};
+  const trend = market.trend || {};
+  const hotTrendText = trend.ok && trend.hotScores && trend.hotScores.length
+    ? trend.hotScores
+        .slice(0, 5)
+        .map((item) => `${item.score}:${item.previous}->${item.current}（${(item.changePct * 100).toFixed(1)}%）`)
+        .join("，")
+    : trend.reason || "暂无明显赔率趋势";
+  const params = data.model && data.model.params ? data.model.params : {};
+  const paramsText = Object.keys(params).length
+    ? `比分市场${fixedParam(params, "score_market_strength", 0.24)}，胜平负市场${fixedParam(params, "market_outcome_strength", 0.38)}，2-0偏置${fixedParam(params, "two_zero_bias")}，3-0偏置${fixedParam(params, "three_zero_bias")}，1-1偏置${fixedParam(params, "one_one_bias")}`
+    : "暂无模型参数";
   const scoreOddsText = Object.keys(scoreOdds).length
     ? Object.entries(scoreOdds)
         .slice(0, 12)
@@ -136,6 +152,12 @@ function renderSources(data) {
     <div class="source-card">
       <strong>竞彩赔率校准</strong>
       <p>${marketText}</p>
+      <p>赔率趋势：${hotTrendText}</p>
+    </div>
+    <div class="source-card">
+      <strong>自动学习参数</strong>
+      <p>${paramsText}</p>
+      <p>版本：${data.model && data.model.version ? data.model.version : "-"}</p>
     </div>
     <div class="source-card">
       <strong>伤停与阵容搜索</strong>
@@ -169,6 +191,7 @@ function renderBacktest(data) {
         <th>主推3覆盖</th>
         <th>保险5覆盖</th>
         <th>Top10覆盖</th>
+        <th>回测来源</th>
         <th>方向</th>
       </tr>
     </thead>
@@ -184,6 +207,7 @@ function renderBacktest(data) {
         <td class="${row.recommendedTop3Hit ? "hit" : "miss"}">${row.recommendedTop3Hit ? "命中" : "未命中"}</td>
         <td class="${row.recommendedTop5Hit ? "hit" : "miss"}">${row.recommendedTop5Hit ? "命中" : "未命中"}</td>
         <td class="${row.top10Hit ? "hit" : "miss"}">${row.top10Hit ? "命中" : "未命中"}</td>
+        <td>${row.evaluationSource || "-"}</td>
         <td class="${row.outcomeHit ? "hit" : "miss"}">${outcomeName(row.predictedOutcome)} / ${outcomeName(row.actualOutcome)}</td>
       </tr>
     `;

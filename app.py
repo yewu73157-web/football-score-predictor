@@ -6,6 +6,7 @@ import re
 import json
 import sqlite3
 import time
+import html
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from dataclasses import dataclass
 from difflib import get_close_matches
@@ -17,13 +18,15 @@ from flask import Flask, jsonify, render_template, request
 
 
 app = Flask(__name__)
-APP_VERSION = "20260704-coverage-tuning1"
+APP_VERSION = "20260704-live-result-refresh1"
 SEARCH_CACHE_TTL_SECONDS = int(os.environ.get("SEARCH_CACHE_TTL_SECONDS", str(24 * 60 * 60)))
 ODDS_CACHE_TTL_SECONDS = int(os.environ.get("ODDS_CACHE_TTL_SECONDS", str(30 * 60)))
+RESULTS_REFRESH_TTL_SECONDS = int(os.environ.get("RESULTS_REFRESH_TTL_SECONDS", str(3 * 60)))
 ODDS_SYNC_TOKEN = os.environ.get("ODDS_SYNC_TOKEN", "football-score-odds-sync-2026")
 RESULTS_SYNC_TOKEN = os.environ.get("RESULTS_SYNC_TOKEN", ODDS_SYNC_TOKEN)
 SEARCH_DB_PATH = os.environ.get("SEARCH_DB_PATH", os.path.join(app.root_path, "data", "web_signals.sqlite3"))
 SPORTTERY_ODDS_URL = "https://webapi.sporttery.cn/gateway/uniform/football/getMatchCalculatorV1.qry?channel=m&poolCode=had,crs"
+GOAL_LIVE_SCORES_URL = "https://www.goal.com/en-sg/live-scores"
 
 DEFAULT_MODEL_PARAMS = {
     "market_outcome_strength": 0.38,
@@ -129,6 +132,41 @@ COMPLETED_MATCHES = [
 REGULATION_SCORE_OVERRIDES = {
     "阿根廷::佛得角": [1, 1],
     "argentina::caboverde": [1, 1],
+}
+
+RESULT_SOURCE_ALIASES = {
+    "DR Congo": "民主刚果",
+    "Cabo Verde": "佛得角",
+    "Ivory Coast": "科特迪瓦",
+    "United States": "美国",
+    "Bosnia and Herzegovina": "波黑",
+    "South Africa": "南非",
+    "Argentina": "阿根廷",
+    "Brazil": "巴西",
+    "Japan": "日本",
+    "Paraguay": "巴拉圭",
+    "Germany": "德国",
+    "Morocco": "摩洛哥",
+    "Netherlands": "荷兰",
+    "Norway": "挪威",
+    "France": "法国",
+    "Sweden": "瑞典",
+    "Mexico": "墨西哥",
+    "Ecuador": "厄瓜多尔",
+    "England": "英格兰",
+    "Belgium": "比利时",
+    "Senegal": "塞内加尔",
+    "Spain": "西班牙",
+    "Austria": "奥地利",
+    "Portugal": "葡萄牙",
+    "Croatia": "克罗地亚",
+    "Switzerland": "瑞士",
+    "Algeria": "阿尔及利亚",
+    "Australia": "澳大利亚",
+    "Egypt": "埃及",
+    "Colombia": "哥伦比亚",
+    "Ghana": "加纳",
+    "Canada": "加拿大",
 }
 
 
@@ -432,6 +470,36 @@ def write_cached_odds(payload: dict[str, Any]) -> None:
             )
 
 
+def read_cache_marker(cache_key: str) -> tuple[dict[str, Any], int] | None:
+    init_search_db()
+    with sqlite3.connect(SEARCH_DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT payload, fetched_at FROM odds_cache WHERE cache_key = ?",
+            (cache_key,),
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        return json.loads(row[0]), int(row[1])
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def write_cache_marker(cache_key: str, payload: dict[str, Any]) -> None:
+    init_search_db()
+    with sqlite3.connect(SEARCH_DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO odds_cache(cache_key, payload, fetched_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(cache_key) DO UPDATE SET
+                payload = excluded.payload,
+                fetched_at = excluded.fetched_at
+            """,
+            (cache_key, json.dumps(payload, ensure_ascii=False), int(time.time())),
+        )
+
+
 def prediction_match_key(home: str, away: str) -> str:
     return f"{normalize_name_for_match(home)}::{normalize_name_for_match(away)}"
 
@@ -514,6 +582,83 @@ def import_completed_results(results: list[dict[str, Any]], source: str = "GitHu
             )
             imported += 1
     return {"ok": imported > 0, "imported": imported}
+
+
+def extract_goal_next_data(page_html: str) -> dict[str, Any]:
+    match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', page_html)
+    if not match:
+        raise RuntimeError("Goal 页面没有返回 __NEXT_DATA__")
+    return json.loads(html.unescape(match.group(1)))
+
+
+def parse_goal_world_cup_results(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    live_scores = payload.get("props", {}).get("pageProps", {}).get("content", {}).get("liveScores", [])
+    results: list[dict[str, Any]] = []
+    for competition_block in live_scores:
+        competition = competition_block.get("competition", {})
+        if competition.get("name") != "World Cup":
+            continue
+        for match in competition_block.get("matches", []):
+            if match.get("status") != "RESULT":
+                continue
+            round_name = (match.get("round") or {}).get("name", "")
+            if "Final" not in round_name:
+                continue
+            team_a = (match.get("teamA") or {}).get("name") or (match.get("teamA") or {}).get("full")
+            team_b = (match.get("teamB") or {}).get("name") or (match.get("teamB") or {}).get("full")
+            score = match.get("score") or {}
+            if team_a not in RESULT_SOURCE_ALIASES or team_b not in RESULT_SOURCE_ALIASES:
+                continue
+            if score.get("teamA") is None or score.get("teamB") is None:
+                continue
+            home = RESULT_SOURCE_ALIASES[team_a]
+            away = RESULT_SOURCE_ALIASES[team_b]
+            home_goals = int(score["teamA"])
+            away_goals = int(score["teamB"])
+            override_score = regulation_score_override(home, away)
+            if override_score:
+                home_goals, away_goals = override_score
+            results.append(
+                {
+                    "home": home,
+                    "away": away,
+                    "homeGoals": home_goals,
+                    "awayGoals": away_goals,
+                    "neutral": True,
+                    "matchDate": str(match.get("startDate", ""))[:10],
+                }
+            )
+    return results
+
+
+def maybe_refresh_completed_results(force: bool = False) -> dict[str, Any]:
+    marker = read_cache_marker("goal_results_refresh")
+    now = int(time.time())
+    if marker and not force:
+        payload, fetched_at = marker
+        age = now - fetched_at
+        if age < RESULTS_REFRESH_TTL_SECONDS:
+            return {"ok": True, "skipped": True, "ageSeconds": age, "last": payload}
+    try:
+        response = requests.get(GOAL_LIVE_SCORES_URL, headers={"User-Agent": HTTP_HEADERS["User-Agent"]}, timeout=4)
+        response.raise_for_status()
+        results = parse_goal_world_cup_results(extract_goal_next_data(response.text))
+        imported = import_completed_results(results, source="页面自动刷新赛果")
+        tuning = tune_model_from_snapshots() if imported["imported"] else {"ok": False, "reason": "没有新增赛果。"}
+        payload = {
+            "ok": True,
+            "imported": imported["imported"],
+            "results": len(results),
+            "tuningOk": bool(tuning.get("ok")),
+            "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        write_cache_marker("goal_results_refresh", payload)
+        return payload
+    except Exception as exc:
+        log_sync_error("results-refresh", str(exc))
+        payload = {"ok": False, "error": str(exc), "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S")}
+        write_cache_marker("goal_results_refresh", payload)
+        return payload
 
 
 def completed_matches_from_db() -> list[dict[str, Any]]:
@@ -1714,10 +1859,13 @@ def api_predict():
 @app.get("/api/backtest")
 def api_backtest():
     try:
+        refresh = maybe_refresh_completed_results(force=request.args.get("refresh", "0") == "1")
         mode = request.args.get("mode", "current")
         if mode not in {"current", "snapshot"}:
             mode = "current"
-        return jsonify(evaluate_completed_matches(mode))
+        data = evaluate_completed_matches(mode)
+        data["refresh"] = refresh
+        return jsonify(data)
     except Exception as exc:
         return jsonify({"error": f"回测失败：{exc}"}), 500
 
@@ -1786,6 +1934,7 @@ def api_results_sync():
 
 @app.get("/api/results/status")
 def api_results_status():
+    refresh = maybe_refresh_completed_results(force=request.args.get("refresh", "0") == "1")
     results = completed_matches_from_db()
     return jsonify(
         {
@@ -1793,6 +1942,7 @@ def api_results_status():
             "matches": len(results),
             "sample": results[-8:],
             "modelParams": model_params(),
+            "refresh": refresh,
         }
     )
 

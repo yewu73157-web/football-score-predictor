@@ -174,8 +174,15 @@ function outcomeName(code) {
 }
 
 function renderBacktest(data) {
+  const refresh = data.refresh || {};
+  const refreshText = refresh.skipped
+    ? `已检查，${Math.round((refresh.ageSeconds || 0) / 60)}分钟前刷新过`
+    : refresh.ok
+      ? `刚刷新，抓到${refresh.results || 0}场，导入${refresh.imported || 0}场`
+      : `刷新失败：${refresh.error || "保留现有赛果"}`;
   backtestSummary.innerHTML = `
     <div class="metric"><span>回测模式</span><strong>${data.mode === "snapshot" ? "预测快照" : "当前模型"}</strong></div>
+    <div class="metric"><span>赛果刷新</span><strong>${refreshText}</strong></div>
     <div class="metric"><span>胜平负方向</span><strong>${pct(data.resultAccuracy)}</strong></div>
     <div class="metric"><span>最可能比分命中</span><strong>${pct(data.exactAccuracy)}</strong></div>
     <div class="metric"><span>主推3个覆盖</span><strong>${pct(data.recommendedTop3Accuracy)}</strong></div>

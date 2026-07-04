@@ -48,6 +48,10 @@ TEAM_ALIASES = {
     "Canada": "加拿大",
 }
 
+REGULATION_SCORE_OVERRIDES = {
+    ("阿根廷", "佛得角"): (1, 1),
+}
+
 
 def extract_next_data(page_html: str) -> dict[str, Any]:
     match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', page_html)
@@ -76,12 +80,21 @@ def parse_world_cup_results(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 continue
             if score.get("teamA") is None or score.get("teamB") is None:
                 continue
+            home = TEAM_ALIASES[team_a]
+            away = TEAM_ALIASES[team_b]
+            home_goals = int(score["teamA"])
+            away_goals = int(score["teamB"])
+            if (home, away) in REGULATION_SCORE_OVERRIDES:
+                home_goals, away_goals = REGULATION_SCORE_OVERRIDES[(home, away)]
+            elif (away, home) in REGULATION_SCORE_OVERRIDES:
+                reverse_away, reverse_home = REGULATION_SCORE_OVERRIDES[(away, home)]
+                home_goals, away_goals = reverse_home, reverse_away
             results.append(
                 {
-                    "home": TEAM_ALIASES[team_a],
-                    "away": TEAM_ALIASES[team_b],
-                    "homeGoals": int(score["teamA"]),
-                    "awayGoals": int(score["teamB"]),
+                    "home": home,
+                    "away": away,
+                    "homeGoals": home_goals,
+                    "awayGoals": away_goals,
                     "neutral": True,
                     "matchDate": str(match.get("startDate", ""))[:10],
                 }

@@ -17,7 +17,7 @@ from flask import Flask, jsonify, render_template, request
 
 
 app = Flask(__name__)
-APP_VERSION = "20260704-odds-trend1"
+APP_VERSION = "20260704-regulation-results1"
 SEARCH_CACHE_TTL_SECONDS = int(os.environ.get("SEARCH_CACHE_TTL_SECONDS", str(24 * 60 * 60)))
 ODDS_CACHE_TTL_SECONDS = int(os.environ.get("ODDS_CACHE_TTL_SECONDS", str(30 * 60)))
 ODDS_SYNC_TOKEN = os.environ.get("ODDS_SYNC_TOKEN", "football-score-odds-sync-2026")
@@ -125,6 +125,12 @@ COMPLETED_MATCHES = [
     {"home": "比利时", "away": "塞内加尔", "score": [2, 2], "neutral": True},
     {"home": "美国", "away": "波黑", "score": [2, 0], "neutral": False},
 ]
+
+REGULATION_SCORE_OVERRIDES = {
+    "阿根廷::佛得角": [1, 1],
+    "argentina::caboverde": [1, 1],
+}
+
 
 # Recent World Cup knockout matches are dominated by narrow wins and low-to-medium
 # scorelines. The multipliers are used only for recommendation order, not for the
@@ -430,6 +436,17 @@ def prediction_match_key(home: str, away: str) -> str:
     return f"{normalize_name_for_match(home)}::{normalize_name_for_match(away)}"
 
 
+def regulation_score_override(home: str, away: str) -> list[int] | None:
+    key = prediction_match_key(home, away)
+    if key in REGULATION_SCORE_OVERRIDES:
+        return REGULATION_SCORE_OVERRIDES[key][:]
+    reverse_key = prediction_match_key(away, home)
+    if reverse_key in REGULATION_SCORE_OVERRIDES:
+        score = REGULATION_SCORE_OVERRIDES[reverse_key]
+        return [score[1], score[0]]
+    return None
+
+
 def save_prediction_snapshot(result: dict[str, Any]) -> None:
     init_search_db()
     payload = json.dumps(result, ensure_ascii=False)
@@ -464,6 +481,9 @@ def import_completed_results(results: list[dict[str, Any]], source: str = "GitHu
                 away_goals = int(item["awayGoals"])
             except (KeyError, TypeError, ValueError):
                 continue
+            override_score = regulation_score_override(home_profile.zh, away_profile.zh)
+            if override_score:
+                home_goals, away_goals = override_score
             key = prediction_match_key(home_profile.zh, away_profile.zh)
             conn.execute(
                 """
@@ -506,17 +526,23 @@ def completed_matches_from_db() -> list[dict[str, Any]]:
             ORDER BY updated_at
             """
         ).fetchall()
-    return [
-        {
+    matches = []
+    for row in rows:
+        score = [int(row[2]), int(row[3])]
+        override_score = regulation_score_override(row[0], row[1])
+        if override_score:
+            score = override_score
+        matches.append(
+            {
             "home": row[0],
             "away": row[1],
-            "score": [int(row[2]), int(row[3])],
+            "score": score,
             "neutral": bool(row[4]),
             "source": row[5],
             "matchDate": row[6],
-        }
-        for row in rows
-    ]
+            }
+        )
+    return matches
 
 
 def all_completed_matches() -> list[dict[str, Any]]:
@@ -645,7 +671,7 @@ def tune_model_from_snapshots() -> dict[str, Any]:
         return {"ok": False, "reason": "暂无自动同步赛果。", "params": model_params()}
     misses = {"clean_sheet": 0, "draw": 0, "high_score": 0, "two_zero": 0, "three_zero": 0, "one_one": 0}
     hits = {"clean_sheet": 0, "draw": 0, "high_score": 0, "two_zero": 0, "three_zero": 0, "one_one": 0}
-    false_alarms = {"draw": 0, "one_one": 0, "clean_sheet": 0}
+    false_alarms = {"draw": 0, "one_one": 0, "clean_sheet": 0, "high_score": 0}
     evaluated = 0
     for match in matches[-20:]:
         snapshot = latest_prediction_snapshot(prediction_match_key(match["home"], match["away"]))
@@ -684,6 +710,8 @@ def tune_model_from_snapshots() -> dict[str, Any]:
             false_alarms["one_one"] += 1
         if predicted_clean and not actual_clean:
             false_alarms["clean_sheet"] += 1
+        if predicted_high and not actual_high:
+            false_alarms["high_score"] += 1
     params = model_params()
     if evaluated:
         updates = dict(params)
@@ -693,7 +721,7 @@ def tune_model_from_snapshots() -> dict[str, Any]:
         # Fast learning: exact-score misses move immediately, but with hard caps.
         bump("clean_sheet_bias", 0.025 * misses["clean_sheet"] - 0.012 * false_alarms["clean_sheet"])
         bump("draw_bias", 0.025 * misses["draw"] - 0.012 * false_alarms["draw"])
-        bump("high_score_bias", 0.025 * misses["high_score"])
+        bump("high_score_bias", 0.025 * misses["high_score"] - 0.012 * false_alarms["high_score"])
         bump("two_zero_bias", 0.045 * misses["two_zero"] - 0.010 * max(0, hits["two_zero"] - misses["two_zero"]), hi=1.38)
         bump("three_zero_bias", 0.040 * misses["three_zero"] - 0.010 * max(0, hits["three_zero"] - misses["three_zero"]), hi=1.34)
         bump("one_one_bias", 0.035 * misses["one_one"] - 0.012 * false_alarms["one_one"], hi=1.30)

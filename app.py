@@ -31,6 +31,9 @@ DEFAULT_MODEL_PARAMS = {
     "clean_sheet_bias": 1.00,
     "draw_bias": 1.00,
     "high_score_bias": 1.00,
+    "two_zero_bias": 1.00,
+    "three_zero_bias": 1.00,
+    "one_one_bias": 1.00,
 }
 
 HTTP_HEADERS = {
@@ -540,43 +543,68 @@ def tune_model_from_snapshots() -> dict[str, Any]:
     matches = completed_matches_from_db()
     if not matches:
         return {"ok": False, "reason": "暂无自动同步赛果。", "params": model_params()}
-    misses = {"clean_sheet": 0, "draw": 0, "high_score": 0}
-    hits = {"clean_sheet": 0, "draw": 0, "high_score": 0}
+    misses = {"clean_sheet": 0, "draw": 0, "high_score": 0, "two_zero": 0, "three_zero": 0, "one_one": 0}
+    hits = {"clean_sheet": 0, "draw": 0, "high_score": 0, "two_zero": 0, "three_zero": 0, "one_one": 0}
+    false_alarms = {"draw": 0, "one_one": 0, "clean_sheet": 0}
     evaluated = 0
     for match in matches[-20:]:
         snapshot = latest_prediction_snapshot(prediction_match_key(match["home"], match["away"]))
         if not snapshot:
-            continue
+            snapshot = predict(match["home"], match["away"], match.get("neutral", True), use_web=False)
         actual = f'{match["score"][0]}-{match["score"][1]}'
         top3 = [item["score"] for item in snapshot.get("coverageScores", {}).get("recommendedTop3", [])]
         evaluated += 1
         actual_clean = match["score"][0] == 0 or match["score"][1] == 0
         actual_draw = match["score"][0] == match["score"][1]
         actual_high = sum(match["score"]) >= 4
+        actual_two_zero = actual in {"2-0", "0-2"}
+        actual_three_zero = actual in {"3-0", "0-3"}
+        actual_one_one = actual == "1-1"
         predicted_clean = any(score.endswith("-0") or score.startswith("0-") for score in top3)
         predicted_draw = any(score.split("-")[0] == score.split("-")[1] for score in top3 if "-" in score)
         predicted_high = any(sum(map(int, score.split("-"))) >= 4 for score in top3 if re.fullmatch(r"\d+-\d+", score))
+        predicted_two_zero = any(score in {"2-0", "0-2"} for score in top3)
+        predicted_three_zero = any(score in {"3-0", "0-3"} for score in top3)
+        predicted_one_one = "1-1" in top3
         for name, actual_flag, predicted_flag in [
             ("clean_sheet", actual_clean, predicted_clean),
             ("draw", actual_draw, predicted_draw),
             ("high_score", actual_high, predicted_high),
+            ("two_zero", actual_two_zero, predicted_two_zero),
+            ("three_zero", actual_three_zero, predicted_three_zero),
+            ("one_one", actual_one_one, predicted_one_one),
         ]:
             if actual_flag and not predicted_flag:
                 misses[name] += 1
             elif actual_flag and predicted_flag:
                 hits[name] += 1
+        if predicted_draw and not actual_draw:
+            false_alarms["draw"] += 1
+        if predicted_one_one and not actual_one_one:
+            false_alarms["one_one"] += 1
+        if predicted_clean and not actual_clean:
+            false_alarms["clean_sheet"] += 1
     params = model_params()
     if evaluated:
         updates = dict(params)
-        if misses["clean_sheet"] > hits["clean_sheet"]:
-            updates["clean_sheet_bias"] = min(1.18, params["clean_sheet_bias"] + 0.02)
-        if misses["draw"] > hits["draw"]:
-            updates["draw_bias"] = min(1.18, params["draw_bias"] + 0.02)
-        if misses["high_score"] > hits["high_score"]:
-            updates["high_score_bias"] = min(1.18, params["high_score_bias"] + 0.02)
+        def bump(name: str, delta: float, lo: float = 0.86, hi: float = 1.28) -> None:
+            updates[name] = max(lo, min(hi, updates.get(name, DEFAULT_MODEL_PARAMS[name]) + delta))
+
+        # Fast learning: exact-score misses move immediately, but with hard caps.
+        bump("clean_sheet_bias", 0.025 * misses["clean_sheet"] - 0.012 * false_alarms["clean_sheet"])
+        bump("draw_bias", 0.025 * misses["draw"] - 0.012 * false_alarms["draw"])
+        bump("high_score_bias", 0.025 * misses["high_score"])
+        bump("two_zero_bias", 0.045 * misses["two_zero"] - 0.010 * max(0, hits["two_zero"] - misses["two_zero"]), hi=1.38)
+        bump("three_zero_bias", 0.040 * misses["three_zero"] - 0.010 * max(0, hits["three_zero"] - misses["three_zero"]), hi=1.34)
+        bump("one_one_bias", 0.035 * misses["one_one"] - 0.012 * false_alarms["one_one"], hi=1.30)
+
+        if misses["two_zero"] or misses["three_zero"] or misses["one_one"]:
+            bump("score_market_strength", 0.015, lo=0.18, hi=0.36)
+        if false_alarms["draw"] >= 2 and not misses["draw"]:
+            bump("market_outcome_strength", 0.01, lo=0.28, hi=0.50)
         if updates != params:
             params = update_model_params(updates)
-    return {"ok": True, "evaluated": evaluated, "misses": misses, "hits": hits, "params": params}
+    return {"ok": True, "mode": "快速学习", "evaluated": evaluated, "misses": misses, "hits": hits, "falseAlarms": false_alarms, "params": params}
 
 
 def normalize_name_for_match(name: str) -> str:
@@ -1088,6 +1116,12 @@ def apply_historical_prior(
             multiplier *= 1.10 * params.get("clean_sheet_bias", 1.0)
         if candidate["home"] == candidate["away"]:
             multiplier *= params.get("draw_bias", 1.0)
+        if candidate["score"] in {"2-0", "0-2"}:
+            multiplier *= params.get("two_zero_bias", 1.0)
+        if candidate["score"] in {"3-0", "0-3"}:
+            multiplier *= params.get("three_zero_bias", 1.0)
+        if candidate["score"] == "1-1":
+            multiplier *= params.get("one_one_bias", 1.0)
         if btts >= 0.50 and total_goals >= 3 and candidate["home"] > 0 and candidate["away"] > 0:
             multiplier *= 1.10
         if over25 >= 0.55 and total_goals >= 3:

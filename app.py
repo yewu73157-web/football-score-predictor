@@ -17,7 +17,7 @@ from flask import Flask, jsonify, render_template, request
 
 
 app = Flask(__name__)
-APP_VERSION = "20260704-regulation-results1"
+APP_VERSION = "20260704-coverage-tuning1"
 SEARCH_CACHE_TTL_SECONDS = int(os.environ.get("SEARCH_CACHE_TTL_SECONDS", str(24 * 60 * 60)))
 ODDS_CACHE_TTL_SECONDS = int(os.environ.get("ODDS_CACHE_TTL_SECONDS", str(30 * 60)))
 ODDS_SYNC_TOKEN = os.environ.get("ODDS_SYNC_TOKEN", "football-score-odds-sync-2026")
@@ -1288,7 +1288,7 @@ def build_coverage_scores(
     add(dict(sorted_scores[0], label="概率最高"))
     if favorite == "home":
         before_small_win = len(recommendations)
-        if btts >= 0.49:
+        if btts >= 0.45 and over25 >= 0.38:
             add(find_best_score(coverage_scores, lambda item: item["home"] > item["away"] and item["home"] - item["away"] == 1 and item["away"] > 0, used, "主队一球小胜"))
         if len(recommendations) == before_small_win:
             add(find_best_score(coverage_scores, lambda item: item["home"] > item["away"] and item["home"] - item["away"] == 1, used, "主队一球小胜"))
@@ -1306,11 +1306,13 @@ def build_coverage_scores(
             add(find_best_score(coverage_scores, lambda item: item["home"] > item["away"] and item["away"] > 0 and item["home"] + item["away"] >= 3, used, "双方进球保护"))
         elif favorite_prob >= 0.52:
             add(find_best_score(coverage_scores, lambda item: item["home"] >= 2 and item["away"] == 0, used, "主队零封保护"))
+        elif favorite_prob >= 0.40 and favorite_margin >= 0.10 and over25 >= 0.38:
+            add(find_best_score(coverage_scores, lambda item: item["home"] >= 2 and item["away"] == 0, used, "主队零封保护"))
         else:
             add(find_best_score(coverage_scores, lambda item: item["home"] == item["away"], used, "平局保护"))
     else:
         before_small_win = len(recommendations)
-        if btts >= 0.49:
+        if btts >= 0.45 and over25 >= 0.38:
             add(find_best_score(coverage_scores, lambda item: item["away"] > item["home"] and item["away"] - item["home"] == 1 and item["home"] > 0, used, "客队一球小胜"))
         if len(recommendations) == before_small_win:
             add(find_best_score(coverage_scores, lambda item: item["away"] > item["home"] and item["away"] - item["home"] == 1, used, "客队一球小胜"))
@@ -1327,6 +1329,8 @@ def build_coverage_scores(
         elif btts >= 0.50 and over25 >= 0.48:
             add(find_best_score(coverage_scores, lambda item: item["away"] > item["home"] and item["home"] > 0 and item["home"] + item["away"] >= 3, used, "双方进球保护"))
         elif favorite_prob >= 0.52:
+            add(find_best_score(coverage_scores, lambda item: item["away"] >= 2 and item["home"] == 0, used, "客队零封保护"))
+        elif favorite_prob >= 0.40 and favorite_margin >= 0.10 and over25 >= 0.38:
             add(find_best_score(coverage_scores, lambda item: item["away"] >= 2 and item["home"] == 0, used, "客队零封保护"))
         else:
             add(find_best_score(coverage_scores, lambda item: item["home"] == item["away"], used, "平局保护"))
@@ -1350,6 +1354,18 @@ def build_coverage_scores(
     top3_scores = recommendations[:]
     top5_scores = [dict(item) for item in top3_scores]
     top5_used = {item["score"] for item in top5_scores}
+    if favorite_prob >= 0.40 and favorite_margin >= 0.10 and over25 >= 0.38:
+        clean_target = "2-0" if favorite == "home" else "0-2"
+        clean_tail = find_best_score(coverage_scores, lambda item: item["score"] == clean_target, top5_used, "零封补位")
+        if clean_tail:
+            top5_scores.append(clean_tail)
+            top5_used.add(clean_tail["score"])
+    if favorite_prob >= 0.50 and over25 >= 0.44:
+        high_clean_target = "3-0" if favorite == "home" else "0-3"
+        high_clean_tail = find_best_score(coverage_scores, lambda item: item["score"] == high_clean_target, top5_used, "强队零封上限")
+        if high_clean_tail:
+            top5_scores.append(high_clean_tail)
+            top5_used.add(high_clean_tail["score"])
     if draw >= 0.28 and btts >= 0.45 and over25 >= 0.36:
         draw_upside = find_best_score(coverage_scores, lambda item: item["score"] == "2-2", top5_used, "高比分平局保护")
         if draw_upside:
@@ -1588,7 +1604,7 @@ def outcome(score: list[int]) -> str:
     return "D"
 
 
-def evaluate_completed_matches() -> dict[str, Any]:
+def evaluate_completed_matches(mode: str = "current") -> dict[str, Any]:
     rows = []
     result_hits = 0
     exact_hits = 0
@@ -1600,8 +1616,12 @@ def evaluate_completed_matches() -> dict[str, Any]:
     for match in completed:
         match_key = prediction_match_key(match["home"], match["away"])
         snapshot = latest_prediction_snapshot(match_key)
-        result = snapshot or predict(match["home"], match["away"], match["neutral"], use_web=False)
-        evaluation_source = "预测快照" if snapshot else "离线重算"
+        if mode == "snapshot" and snapshot:
+            result = snapshot
+            evaluation_source = "预测快照"
+        else:
+            result = predict(match["home"], match["away"], match["neutral"], use_web=False)
+            evaluation_source = "当前模型复盘"
         probs = result["probabilities"]
         pmap = {"H": probs["homeWin"], "D": probs["draw"], "A": probs["awayWin"]}
         predicted_outcome = max(pmap, key=pmap.get)
@@ -1659,6 +1679,7 @@ def evaluate_completed_matches() -> dict[str, Any]:
         "recommendedTop3Accuracy": recommended3_hits / total,
         "recommendedTop5Accuracy": recommended5_hits / total,
         "top10Accuracy": top10_hits / total,
+        "mode": mode,
         "rows": rows,
     }
 
@@ -1693,7 +1714,10 @@ def api_predict():
 @app.get("/api/backtest")
 def api_backtest():
     try:
-        return jsonify(evaluate_completed_matches())
+        mode = request.args.get("mode", "current")
+        if mode not in {"current", "snapshot"}:
+            mode = "current"
+        return jsonify(evaluate_completed_matches(mode))
     except Exception as exc:
         return jsonify({"error": f"回测失败：{exc}"}), 500
 

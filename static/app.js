@@ -175,6 +175,7 @@ function outcomeName(code) {
 
 function renderBacktest(data) {
   backtestSummary.innerHTML = `
+    <div class="metric"><span>回测模式</span><strong>${data.mode === "snapshot" ? "预测快照" : "当前模型"}</strong></div>
     <div class="metric"><span>胜平负方向</span><strong>${pct(data.resultAccuracy)}</strong></div>
     <div class="metric"><span>最可能比分命中</span><strong>${pct(data.exactAccuracy)}</strong></div>
     <div class="metric"><span>主推3个覆盖</span><strong>${pct(data.recommendedTop3Accuracy)}</strong></div>

@@ -18,7 +18,7 @@ from flask import Flask, jsonify, render_template, request
 
 
 app = Flask(__name__)
-APP_VERSION = "20260704-live-result-refresh1"
+APP_VERSION = "20260706-results-refresh-stable-tuning"
 SEARCH_CACHE_TTL_SECONDS = int(os.environ.get("SEARCH_CACHE_TTL_SECONDS", str(24 * 60 * 60)))
 ODDS_CACHE_TTL_SECONDS = int(os.environ.get("ODDS_CACHE_TTL_SECONDS", str(30 * 60)))
 RESULTS_REFRESH_TTL_SECONDS = int(os.environ.get("RESULTS_REFRESH_TTL_SECONDS", str(3 * 60)))
@@ -37,6 +37,17 @@ DEFAULT_MODEL_PARAMS = {
     "two_zero_bias": 1.00,
     "three_zero_bias": 1.00,
     "one_one_bias": 1.00,
+}
+
+MODEL_PARAM_BOUNDS = {
+    "market_outcome_strength": (0.32, 0.44),
+    "score_market_strength": (0.18, 0.30),
+    "clean_sheet_bias": (0.92, 1.12),
+    "draw_bias": (0.92, 1.12),
+    "high_score_bias": (0.92, 1.12),
+    "two_zero_bias": (0.92, 1.18),
+    "three_zero_bias": (0.92, 1.18),
+    "one_one_bias": (0.92, 1.12),
 }
 
 HTTP_HEADERS = {
@@ -358,7 +369,11 @@ def model_params() -> dict[str, float]:
             )
         rows = conn.execute("SELECT name, value FROM model_params").fetchall()
     params = dict(DEFAULT_MODEL_PARAMS)
-    params.update({name: float(value) for name, value in rows})
+    for name, value in rows:
+        if name not in DEFAULT_MODEL_PARAMS:
+            continue
+        lo, hi = MODEL_PARAM_BOUNDS.get(name, (0.0, float("inf")))
+        params[name] = max(lo, min(hi, float(value)))
     return params
 
 
@@ -537,6 +552,7 @@ def save_prediction_snapshot(result: dict[str, Any]) -> None:
 
 def import_completed_results(results: list[dict[str, Any]], source: str = "GitHub Actions 自动同步赛果") -> dict[str, Any]:
     imported = 0
+    changed = 0
     init_search_db()
     with sqlite3.connect(SEARCH_DB_PATH) as conn:
         for item in results:
@@ -553,6 +569,20 @@ def import_completed_results(results: list[dict[str, Any]], source: str = "GitHu
             if override_score:
                 home_goals, away_goals = override_score
             key = prediction_match_key(home_profile.zh, away_profile.zh)
+            match_date = str(item.get("matchDate", ""))
+            neutral = 1 if item.get("neutral", True) else 0
+            existing = conn.execute(
+                """
+                SELECT home_goals, away_goals, neutral, match_date
+                FROM completed_results
+                WHERE match_key = ?
+                """,
+                (key,),
+            ).fetchone()
+            if existing == (home_goals, away_goals, neutral, match_date):
+                imported += 1
+                continue
+            changed += 1
             conn.execute(
                 """
                 INSERT INTO completed_results(
@@ -574,14 +604,14 @@ def import_completed_results(results: list[dict[str, Any]], source: str = "GitHu
                     away_profile.zh,
                     home_goals,
                     away_goals,
-                    1 if item.get("neutral", True) else 0,
+                    neutral,
                     source,
-                    str(item.get("matchDate", "")),
+                    match_date,
                     int(time.time()),
                 ),
             )
             imported += 1
-    return {"ok": imported > 0, "imported": imported}
+    return {"ok": imported > 0, "imported": imported, "changed": changed}
 
 
 def extract_goal_next_data(page_html: str) -> dict[str, Any]:
@@ -644,10 +674,11 @@ def maybe_refresh_completed_results(force: bool = False) -> dict[str, Any]:
         response.raise_for_status()
         results = parse_goal_world_cup_results(extract_goal_next_data(response.text))
         imported = import_completed_results(results, source="页面自动刷新赛果")
-        tuning = tune_model_from_snapshots() if imported["imported"] else {"ok": False, "reason": "没有新增赛果。"}
+        tuning = tune_model_from_snapshots() if imported["changed"] else {"ok": False, "reason": "赛果没有新增或变化。"}
         payload = {
             "ok": True,
             "imported": imported["imported"],
+            "changed": imported["changed"],
             "results": len(results),
             "tuningOk": bool(tuning.get("ok")),
             "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -860,21 +891,25 @@ def tune_model_from_snapshots() -> dict[str, Any]:
     params = model_params()
     if evaluated:
         updates = dict(params)
-        def bump(name: str, delta: float, lo: float = 0.86, hi: float = 1.28) -> None:
+        learning_scale = min(1.0, max(0.25, evaluated / 20))
+
+        def bump(name: str, delta: float) -> None:
+            lo, hi = MODEL_PARAM_BOUNDS[name]
+            delta *= learning_scale
             updates[name] = max(lo, min(hi, updates.get(name, DEFAULT_MODEL_PARAMS[name]) + delta))
 
-        # Fast learning: exact-score misses move immediately, but with hard caps.
+        # Keep automatic learning conservative; knockout samples are too small for aggressive retuning.
         bump("clean_sheet_bias", 0.025 * misses["clean_sheet"] - 0.012 * false_alarms["clean_sheet"])
         bump("draw_bias", 0.025 * misses["draw"] - 0.012 * false_alarms["draw"])
         bump("high_score_bias", 0.025 * misses["high_score"] - 0.012 * false_alarms["high_score"])
-        bump("two_zero_bias", 0.045 * misses["two_zero"] - 0.010 * max(0, hits["two_zero"] - misses["two_zero"]), hi=1.38)
-        bump("three_zero_bias", 0.040 * misses["three_zero"] - 0.010 * max(0, hits["three_zero"] - misses["three_zero"]), hi=1.34)
-        bump("one_one_bias", 0.035 * misses["one_one"] - 0.012 * false_alarms["one_one"], hi=1.30)
+        bump("two_zero_bias", 0.025 * misses["two_zero"] - 0.008 * max(0, hits["two_zero"] - misses["two_zero"]))
+        bump("three_zero_bias", 0.025 * misses["three_zero"] - 0.008 * max(0, hits["three_zero"] - misses["three_zero"]))
+        bump("one_one_bias", 0.022 * misses["one_one"] - 0.010 * false_alarms["one_one"])
 
         if misses["two_zero"] or misses["three_zero"] or misses["one_one"]:
-            bump("score_market_strength", 0.015, lo=0.18, hi=0.36)
+            bump("score_market_strength", 0.008)
         if false_alarms["draw"] >= 2 and not misses["draw"]:
-            bump("market_outcome_strength", 0.01, lo=0.28, hi=0.50)
+            bump("market_outcome_strength", 0.006)
         if updates != params:
             params = update_model_params(updates)
     return {"ok": True, "mode": "快速学习", "evaluated": evaluated, "misses": misses, "hits": hits, "falseAlarms": false_alarms, "params": params}
@@ -1499,29 +1534,52 @@ def build_coverage_scores(
     top3_scores = recommendations[:]
     top5_scores = [dict(item) for item in top3_scores]
     top5_used = {item["score"] for item in top5_scores}
+
+    def add_top5(candidate: dict[str, Any] | None) -> None:
+        if candidate and candidate["score"] not in top5_used and len(top5_scores) < 5:
+            top5_scores.append(candidate)
+            top5_used.add(candidate["score"])
+
+    if draw >= 0.28 and btts >= 0.45 and over25 >= 0.36:
+        add_top5(find_best_score(coverage_scores, lambda item: item["score"] == "2-2", top5_used, "高比分平局保护"))
+
+    strong_favorite = favorite_prob >= 0.56 or favorite_margin >= 0.24
+
+    if strong_favorite:
+        narrow_clean_target = "1-0" if favorite == "home" else "0-1"
+        add_top5(find_best_score(coverage_scores, lambda item: item["score"] == narrow_clean_target, top5_used, "一球零封保护"))
+        if over25 >= 0.44:
+            high_clean_target = "3-0" if favorite == "home" else "0-3"
+            add_top5(find_best_score(coverage_scores, lambda item: item["score"] == high_clean_target, top5_used, "强队零封上限"))
+
+    if btts >= 0.44 and over25 >= 0.38:
+        if favorite == "home":
+            add_top5(find_best_score(coverage_scores, lambda item: item["score"] == "3-2", top5_used, "高比分一球差"))
+        else:
+            add_top5(find_best_score(coverage_scores, lambda item: item["score"] == "2-3", top5_used, "高比分一球差"))
+
+    if favorite_prob < 0.50 or favorite_margin < 0.16:
+        if favorite == "home":
+            add_top5(find_best_score(coverage_scores, lambda item: item["away"] > item["home"] and item["away"] - item["home"] == 1, top5_used, "冷门一球差"))
+            if btts >= 0.44 and over25 >= 0.38:
+                add_top5(find_best_score(coverage_scores, lambda item: item["score"] == "2-3", top5_used, "高比分冷门"))
+        else:
+            add_top5(find_best_score(coverage_scores, lambda item: item["home"] > item["away"] and item["home"] - item["away"] == 1, top5_used, "冷门一球差"))
+            if btts >= 0.44 and over25 >= 0.38:
+                add_top5(find_best_score(coverage_scores, lambda item: item["score"] == "3-2", top5_used, "高比分冷门"))
+
+    if not strong_favorite and (favorite_prob >= 0.50 or favorite_margin >= 0.16):
+        narrow_clean_target = "1-0" if favorite == "home" else "0-1"
+        add_top5(find_best_score(coverage_scores, lambda item: item["score"] == narrow_clean_target, top5_used, "一球零封保护"))
+
     if favorite_prob >= 0.40 and favorite_margin >= 0.10 and over25 >= 0.38:
         clean_target = "2-0" if favorite == "home" else "0-2"
-        clean_tail = find_best_score(coverage_scores, lambda item: item["score"] == clean_target, top5_used, "零封补位")
-        if clean_tail:
-            top5_scores.append(clean_tail)
-            top5_used.add(clean_tail["score"])
-    if favorite_prob >= 0.50 and over25 >= 0.44:
-        high_clean_target = "3-0" if favorite == "home" else "0-3"
-        high_clean_tail = find_best_score(coverage_scores, lambda item: item["score"] == high_clean_target, top5_used, "强队零封上限")
-        if high_clean_tail:
-            top5_scores.append(high_clean_tail)
-            top5_used.add(high_clean_tail["score"])
-    if draw >= 0.28 and btts >= 0.45 and over25 >= 0.36:
-        draw_upside = find_best_score(coverage_scores, lambda item: item["score"] == "2-2", top5_used, "高比分平局保护")
-        if draw_upside:
-            top5_scores.append(draw_upside)
-            top5_used.add(draw_upside["score"])
+        add_top5(find_best_score(coverage_scores, lambda item: item["score"] == clean_target, top5_used, "零封补位"))
     for item in coverage_scores:
         if item["score"] not in top5_used:
             candidate = dict(item)
             candidate["label"] = candidate.get("label") or "保险补位"
-            top5_scores.append(candidate)
-            top5_used.add(candidate["score"])
+            add_top5(candidate)
         if len(top5_scores) >= 5:
             break
 
@@ -1918,11 +1976,12 @@ def api_results_sync():
         return jsonify({"error": "results 必须是数组"}), 400
     try:
         imported = import_completed_results(results)
-        tuning = tune_model_from_snapshots()
+        tuning = tune_model_from_snapshots() if imported["changed"] else {"ok": False, "reason": "赛果没有新增或变化。"}
         return jsonify(
             {
                 "ok": imported["ok"],
                 "imported": imported["imported"],
+                "changed": imported["changed"],
                 "tuning": tuning,
                 "generatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
             }

@@ -10,15 +10,19 @@ import requests
 
 
 GOAL_LIVE_SCORES_URL = "https://www.goal.com/en-sg/live-scores"
+ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard"
 DEFAULT_SYNC_URL = "https://gongwenjie.pythonanywhere.com/api/results/sync"
 DEFAULT_SYNC_TOKEN = "football-score-odds-sync-2026"
 
 TEAM_ALIASES = {
     "DR Congo": "民主刚果",
+    "Congo DR": "民主刚果",
     "Cabo Verde": "佛得角",
+    "Cape Verde": "佛得角",
     "Ivory Coast": "科特迪瓦",
     "United States": "美国",
     "Bosnia and Herzegovina": "波黑",
+    "Bosnia-Herzegovina": "波黑",
     "South Africa": "南非",
     "Argentina": "阿根廷",
     "Brazil": "巴西",
@@ -50,6 +54,8 @@ TEAM_ALIASES = {
 
 REGULATION_SCORE_OVERRIDES = {
     ("阿根廷", "佛得角"): (1, 1),
+    ("比利时", "塞内加尔"): (2, 2),
+    ("澳大利亚", "埃及"): (1, 1),
 }
 
 
@@ -102,16 +108,86 @@ def parse_world_cup_results(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return results
 
 
+def parse_espn_world_cup_results(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for event in payload.get("events", []):
+        competitions = event.get("competitions") or []
+        if not competitions:
+            continue
+        competition = competitions[0]
+        status_type = (competition.get("status") or {}).get("type") or {}
+        if not status_type.get("completed"):
+            continue
+        status_name = str(status_type.get("name", ""))
+        competitors = competition.get("competitors") or []
+        home_comp = next((item for item in competitors if item.get("homeAway") == "home"), None)
+        away_comp = next((item for item in competitors if item.get("homeAway") == "away"), None)
+        if not home_comp or not away_comp:
+            continue
+        home_name = (home_comp.get("team") or {}).get("displayName")
+        away_name = (away_comp.get("team") or {}).get("displayName")
+        if home_name not in TEAM_ALIASES or away_name not in TEAM_ALIASES:
+            continue
+        home = TEAM_ALIASES[home_name]
+        away = TEAM_ALIASES[away_name]
+        override = REGULATION_SCORE_OVERRIDES.get((home, away))
+        if not override and (away, home) in REGULATION_SCORE_OVERRIDES:
+            reverse_away, reverse_home = REGULATION_SCORE_OVERRIDES[(away, home)]
+            override = (reverse_home, reverse_away)
+        if ("AET" in status_name or "PEN" in status_name) and not override:
+            continue
+        try:
+            home_goals = int(home_comp.get("score"))
+            away_goals = int(away_comp.get("score"))
+        except (TypeError, ValueError):
+            continue
+        if override:
+            home_goals, away_goals = override
+        results.append(
+            {
+                "home": home,
+                "away": away,
+                "homeGoals": home_goals,
+                "awayGoals": away_goals,
+                "neutral": True,
+                "matchDate": str(event.get("date", ""))[:10],
+            }
+        )
+    return results
+
+
+def fetch_espn_results() -> list[dict[str, Any]]:
+    response = requests.get(
+        ESPN_SCOREBOARD_URL,
+        params={"dates": os.environ.get("ESPN_RESULTS_DATES", "20260701-20260720"), "limit": "100"},
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=20,
+    )
+    response.raise_for_status()
+    return parse_espn_world_cup_results(response.json())
+
+
+def fetch_goal_results() -> list[dict[str, Any]]:
+    response = requests.get(GOAL_LIVE_SCORES_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
+    response.raise_for_status()
+    return parse_world_cup_results(extract_next_data(response.text))
+
+
 def main() -> int:
     sync_url = os.environ.get("RESULTS_SYNC_URL", DEFAULT_SYNC_URL)
     sync_token = os.environ.get("RESULTS_SYNC_TOKEN", os.environ.get("ODDS_SYNC_TOKEN", DEFAULT_SYNC_TOKEN))
     try:
-        response = requests.get(GOAL_LIVE_SCORES_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
-        response.raise_for_status()
-        results = parse_world_cup_results(extract_next_data(response.text))
+        try:
+            results = fetch_espn_results()
+            source = "ESPN"
+        except Exception as espn_exc:
+            print(f"ESPN results fetch failed, falling back to Goal: {espn_exc}")
+            results = fetch_goal_results()
+            source = "Goal"
         if not results:
             print("No completed World Cup final-stage results found; keeping existing results.")
             return 0
+        print(f"Fetched {len(results)} results from {source}.")
         sync_response = requests.post(
             sync_url,
             headers={"X-Results-Sync-Token": sync_token, "Content-Type": "application/json"},

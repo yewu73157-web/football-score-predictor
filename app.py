@@ -18,7 +18,7 @@ from flask import Flask, jsonify, render_template, request
 
 
 app = Flask(__name__)
-APP_VERSION = "20260706-results-refresh-stable-tuning"
+APP_VERSION = "20260707-espn-results-sync"
 SEARCH_CACHE_TTL_SECONDS = int(os.environ.get("SEARCH_CACHE_TTL_SECONDS", str(24 * 60 * 60)))
 ODDS_CACHE_TTL_SECONDS = int(os.environ.get("ODDS_CACHE_TTL_SECONDS", str(30 * 60)))
 RESULTS_REFRESH_TTL_SECONDS = int(os.environ.get("RESULTS_REFRESH_TTL_SECONDS", str(3 * 60)))
@@ -27,6 +27,7 @@ RESULTS_SYNC_TOKEN = os.environ.get("RESULTS_SYNC_TOKEN", ODDS_SYNC_TOKEN)
 SEARCH_DB_PATH = os.environ.get("SEARCH_DB_PATH", os.path.join(app.root_path, "data", "web_signals.sqlite3"))
 SPORTTERY_ODDS_URL = "https://webapi.sporttery.cn/gateway/uniform/football/getMatchCalculatorV1.qry?channel=m&poolCode=had,crs"
 GOAL_LIVE_SCORES_URL = "https://www.goal.com/en-sg/live-scores"
+ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard"
 
 DEFAULT_MODEL_PARAMS = {
     "market_outcome_strength": 0.38,
@@ -143,14 +144,21 @@ COMPLETED_MATCHES = [
 REGULATION_SCORE_OVERRIDES = {
     "阿根廷::佛得角": [1, 1],
     "argentina::caboverde": [1, 1],
+    "比利时::塞内加尔": [2, 2],
+    "belgium::senegal": [2, 2],
+    "澳大利亚::埃及": [1, 1],
+    "australia::egypt": [1, 1],
 }
 
 RESULT_SOURCE_ALIASES = {
     "DR Congo": "民主刚果",
+    "Congo DR": "民主刚果",
     "Cabo Verde": "佛得角",
+    "Cape Verde": "佛得角",
     "Ivory Coast": "科特迪瓦",
     "United States": "美国",
     "Bosnia and Herzegovina": "波黑",
+    "Bosnia-Herzegovina": "波黑",
     "South Africa": "南非",
     "Argentina": "阿根廷",
     "Brazil": "巴西",
@@ -661,6 +669,68 @@ def parse_goal_world_cup_results(payload: dict[str, Any]) -> list[dict[str, Any]
     return results
 
 
+def parse_espn_world_cup_results(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for event in payload.get("events", []):
+        competitions = event.get("competitions") or []
+        if not competitions:
+            continue
+        competition = competitions[0]
+        status_type = (competition.get("status") or {}).get("type") or {}
+        if not status_type.get("completed"):
+            continue
+        status_name = str(status_type.get("name", ""))
+        competitors = competition.get("competitors") or []
+        home_comp = next((item for item in competitors if item.get("homeAway") == "home"), None)
+        away_comp = next((item for item in competitors if item.get("homeAway") == "away"), None)
+        if not home_comp or not away_comp:
+            continue
+        home_name = (home_comp.get("team") or {}).get("displayName")
+        away_name = (away_comp.get("team") or {}).get("displayName")
+        if home_name not in RESULT_SOURCE_ALIASES or away_name not in RESULT_SOURCE_ALIASES:
+            continue
+        home = RESULT_SOURCE_ALIASES[home_name]
+        away = RESULT_SOURCE_ALIASES[away_name]
+        override_score = regulation_score_override(home, away)
+        if ("AET" in status_name or "PEN" in status_name) and not override_score:
+            continue
+        try:
+            home_goals = int(home_comp.get("score"))
+            away_goals = int(away_comp.get("score"))
+        except (TypeError, ValueError):
+            continue
+        if override_score:
+            home_goals, away_goals = override_score
+        results.append(
+            {
+                "home": home,
+                "away": away,
+                "homeGoals": home_goals,
+                "awayGoals": away_goals,
+                "neutral": True,
+                "matchDate": str(event.get("date", ""))[:10],
+            }
+        )
+    return results
+
+
+def fetch_espn_world_cup_results() -> list[dict[str, Any]]:
+    response = requests.get(
+        ESPN_SCOREBOARD_URL,
+        params={"dates": os.environ.get("ESPN_RESULTS_DATES", "20260701-20260720"), "limit": "100"},
+        headers={"User-Agent": HTTP_HEADERS["User-Agent"]},
+        timeout=5,
+    )
+    response.raise_for_status()
+    return parse_espn_world_cup_results(response.json())
+
+
+def fetch_goal_world_cup_results() -> list[dict[str, Any]]:
+    response = requests.get(GOAL_LIVE_SCORES_URL, headers={"User-Agent": HTTP_HEADERS["User-Agent"]}, timeout=4)
+    response.raise_for_status()
+    return parse_goal_world_cup_results(extract_goal_next_data(response.text))
+
+
 def maybe_refresh_completed_results(force: bool = False) -> dict[str, Any]:
     marker = read_cache_marker("goal_results_refresh")
     now = int(time.time())
@@ -669,14 +739,18 @@ def maybe_refresh_completed_results(force: bool = False) -> dict[str, Any]:
         age = now - fetched_at
         if age < RESULTS_REFRESH_TTL_SECONDS:
             return {"ok": True, "skipped": True, "ageSeconds": age, "last": payload}
+    source = "ESPN 世界杯赛程接口"
     try:
-        response = requests.get(GOAL_LIVE_SCORES_URL, headers={"User-Agent": HTTP_HEADERS["User-Agent"]}, timeout=4)
-        response.raise_for_status()
-        results = parse_goal_world_cup_results(extract_goal_next_data(response.text))
+        try:
+            results = fetch_espn_world_cup_results()
+        except Exception as espn_exc:
+            source = "Goal live-scores 页面"
+            results = fetch_goal_world_cup_results()
         imported = import_completed_results(results, source="页面自动刷新赛果")
         tuning = tune_model_from_snapshots() if imported["changed"] else {"ok": False, "reason": "赛果没有新增或变化。"}
         payload = {
             "ok": True,
+            "source": source,
             "imported": imported["imported"],
             "changed": imported["changed"],
             "results": len(results),
@@ -1539,6 +1613,10 @@ def build_coverage_scores(
         if candidate and candidate["score"] not in top5_used and len(top5_scores) < 5:
             top5_scores.append(candidate)
             top5_used.add(candidate["score"])
+
+    if favorite_prob >= 0.38 and over25 < 0.52:
+        narrow_clean_target = "1-0" if favorite == "home" else "0-1"
+        add_top5(find_best_score(coverage_scores, lambda item: item["score"] == narrow_clean_target, top5_used, "一球零封保护"))
 
     if draw >= 0.28 and btts >= 0.45 and over25 >= 0.36:
         add_top5(find_best_score(coverage_scores, lambda item: item["score"] == "2-2", top5_used, "高比分平局保护"))

@@ -148,6 +148,8 @@ REGULATION_SCORE_OVERRIDES = {
     "belgium::senegal": [2, 2],
     "澳大利亚::埃及": [1, 1],
     "australia::egypt": [1, 1],
+    "瑞士::哥伦比亚": [0, 0],
+    "switzerland::colombia": [0, 0],
 }
 
 RESULT_SOURCE_ALIASES = {
@@ -692,7 +694,7 @@ def parse_espn_world_cup_results(payload: dict[str, Any]) -> list[dict[str, Any]
         home = RESULT_SOURCE_ALIASES[home_name]
         away = RESULT_SOURCE_ALIASES[away_name]
         override_score = regulation_score_override(home, away)
-        if ("AET" in status_name or "PEN" in status_name) and not override_score:
+        if "AET" in status_name and not override_score:
             continue
         try:
             home_goals = int(home_comp.get("score"))

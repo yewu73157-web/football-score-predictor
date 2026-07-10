@@ -18,7 +18,7 @@ from flask import Flask, jsonify, render_template, request
 
 
 app = Flask(__name__)
-APP_VERSION = "20260707-espn-results-sync"
+APP_VERSION = "20260710-final-stage-market-model"
 SEARCH_CACHE_TTL_SECONDS = int(os.environ.get("SEARCH_CACHE_TTL_SECONDS", str(24 * 60 * 60)))
 ODDS_CACHE_TTL_SECONDS = int(os.environ.get("ODDS_CACHE_TTL_SECONDS", str(30 * 60)))
 RESULTS_REFRESH_TTL_SECONDS = int(os.environ.get("RESULTS_REFRESH_TTL_SECONDS", str(3 * 60)))
@@ -30,8 +30,8 @@ GOAL_LIVE_SCORES_URL = "https://www.goal.com/en-sg/live-scores"
 ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard"
 
 DEFAULT_MODEL_PARAMS = {
-    "market_outcome_strength": 0.38,
-    "score_market_strength": 0.24,
+    "market_outcome_strength": 0.58,
+    "score_market_strength": 0.42,
     "clean_sheet_bias": 1.00,
     "draw_bias": 1.00,
     "high_score_bias": 1.00,
@@ -41,8 +41,8 @@ DEFAULT_MODEL_PARAMS = {
 }
 
 MODEL_PARAM_BOUNDS = {
-    "market_outcome_strength": (0.32, 0.44),
-    "score_market_strength": (0.18, 0.30),
+    "market_outcome_strength": (0.52, 0.66),
+    "score_market_strength": (0.34, 0.50),
     "clean_sheet_bias": (0.92, 1.12),
     "draw_bias": (0.92, 1.12),
     "high_score_bias": (0.92, 1.12),
@@ -50,6 +50,21 @@ MODEL_PARAM_BOUNDS = {
     "three_zero_bias": (0.92, 1.18),
     "one_one_bias": (0.92, 1.12),
 }
+
+# In the last few knockout matches, a small batch of newly completed games is
+# not enough evidence to retune the whole model.  Keep this profile fixed and
+# let the latest pre-match market data do the meaningful per-match adjustment.
+FINAL_STAGE_MODEL_PARAMS = {
+    "market_outcome_strength": 0.58,
+    "score_market_strength": 0.42,
+    "clean_sheet_bias": 1.00,
+    "draw_bias": 1.00,
+    "high_score_bias": 1.00,
+    "two_zero_bias": 1.00,
+    "three_zero_bias": 1.00,
+    "one_one_bias": 1.00,
+}
+HISTORICAL_PRIOR_STRENGTH = 0.35
 
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 Chrome/126 Mobile Safari/537.36",
@@ -405,6 +420,11 @@ def update_model_params(updates: dict[str, float]) -> dict[str, float]:
                 (name, float(value), now),
             )
     return model_params()
+
+
+def final_stage_model_params() -> dict[str, float]:
+    """Return the stable final-stage profile instead of reusing noisy live tuning."""
+    return dict(FINAL_STAGE_MODEL_PARAMS)
 
 
 def cached_payload_age(fetched_at: int) -> int:
@@ -920,7 +940,7 @@ def odds_trend_for_match(home_profile: TeamProfile, away_profile: TeamProfile) -
 def tune_model_from_snapshots() -> dict[str, Any]:
     matches = completed_matches_from_db()
     if not matches:
-        return {"ok": False, "reason": "暂无自动同步赛果。", "params": model_params()}
+        return {"ok": False, "reason": "暂无自动同步赛果。", "params": final_stage_model_params()}
     misses = {"clean_sheet": 0, "draw": 0, "high_score": 0, "two_zero": 0, "three_zero": 0, "one_one": 0}
     hits = {"clean_sheet": 0, "draw": 0, "high_score": 0, "two_zero": 0, "three_zero": 0, "one_one": 0}
     false_alarms = {"draw": 0, "one_one": 0, "clean_sheet": 0, "high_score": 0}
@@ -964,31 +984,18 @@ def tune_model_from_snapshots() -> dict[str, Any]:
             false_alarms["clean_sheet"] += 1
         if predicted_high and not actual_high:
             false_alarms["high_score"] += 1
-    params = model_params()
-    if evaluated:
-        updates = dict(params)
-        learning_scale = min(1.0, max(0.25, evaluated / 20))
-
-        def bump(name: str, delta: float) -> None:
-            lo, hi = MODEL_PARAM_BOUNDS[name]
-            delta *= learning_scale
-            updates[name] = max(lo, min(hi, updates.get(name, DEFAULT_MODEL_PARAMS[name]) + delta))
-
-        # Keep automatic learning conservative; knockout samples are too small for aggressive retuning.
-        bump("clean_sheet_bias", 0.025 * misses["clean_sheet"] - 0.012 * false_alarms["clean_sheet"])
-        bump("draw_bias", 0.025 * misses["draw"] - 0.012 * false_alarms["draw"])
-        bump("high_score_bias", 0.025 * misses["high_score"] - 0.012 * false_alarms["high_score"])
-        bump("two_zero_bias", 0.025 * misses["two_zero"] - 0.008 * max(0, hits["two_zero"] - misses["two_zero"]))
-        bump("three_zero_bias", 0.025 * misses["three_zero"] - 0.008 * max(0, hits["three_zero"] - misses["three_zero"]))
-        bump("one_one_bias", 0.022 * misses["one_one"] - 0.010 * false_alarms["one_one"])
-
-        if misses["two_zero"] or misses["three_zero"] or misses["one_one"]:
-            bump("score_market_strength", 0.008)
-        if false_alarms["draw"] >= 2 and not misses["draw"]:
-            bump("market_outcome_strength", 0.006)
-        if updates != params:
-            params = update_model_params(updates)
-    return {"ok": True, "mode": "快速学习", "evaluated": evaluated, "misses": misses, "hits": hits, "falseAlarms": false_alarms, "params": params}
+    # Results are still collected immediately for the backtest.  Parameters are
+    # deliberately frozen: retuning from one late-stage upset creates more
+    # variance than signal for the remaining fixtures.
+    return {
+        "ok": True,
+        "mode": "最终阶段慢更新（仅回测，不自动改写参数）",
+        "evaluated": evaluated,
+        "misses": misses,
+        "hits": hits,
+        "falseAlarms": false_alarms,
+        "params": final_stage_model_params(),
+    }
 
 
 def normalize_name_for_match(name: str) -> str:
@@ -1473,15 +1480,17 @@ def apply_historical_prior(
     adjusted = []
     for item in all_scores:
         candidate = dict(item)
-        multiplier = HISTORICAL_KNOCKOUT_PRIOR.get(candidate["score"], 0.82)
+        # Historical knockout scores are a weak prior only.  It must not undo
+        # the more informative pre-match odds in the final stage.
+        multiplier = HISTORICAL_KNOCKOUT_PRIOR.get(candidate["score"], 0.82) ** HISTORICAL_PRIOR_STRENGTH
         total_goals = candidate["home"] + candidate["away"]
         is_favorite_win = candidate["home"] > candidate["away"] if favorite == "home" else candidate["away"] > candidate["home"]
         is_clean_sheet = candidate["away"] == 0 if favorite == "home" else candidate["home"] == 0
 
         if is_favorite_win:
-            multiplier *= 1.04
+            multiplier *= 1.015
         if favorite_prob >= 0.54 and is_favorite_win and is_clean_sheet:
-            multiplier *= 1.10 * params.get("clean_sheet_bias", 1.0)
+            multiplier *= 1.03 * params.get("clean_sheet_bias", 1.0)
         if candidate["home"] == candidate["away"]:
             multiplier *= params.get("draw_bias", 1.0)
         if candidate["score"] in {"2-0", "0-2"}:
@@ -1491,27 +1500,27 @@ def apply_historical_prior(
         if candidate["score"] == "1-1":
             multiplier *= params.get("one_one_bias", 1.0)
         if btts >= 0.50 and total_goals >= 3 and candidate["home"] > 0 and candidate["away"] > 0:
-            multiplier *= 1.10
+            multiplier *= 1.04
         if over25 >= 0.55 and total_goals >= 3:
-            multiplier *= 1.08 * params.get("high_score_bias", 1.0)
+            multiplier *= 1.04 * params.get("high_score_bias", 1.0)
         if over25 < 0.50 and total_goals >= 4:
-            multiplier *= 0.72
+            multiplier *= 0.90
         if candidate["score"] == "2-2" and draw >= 0.28 and btts >= 0.45 and over25 >= 0.36:
-            multiplier *= 1.65
+            multiplier *= 1.05
         if candidate["score"] in {"3-2", "2-3"} and btts >= 0.50 and over25 >= 0.48 and (favorite_prob < 0.48 or draw >= 0.24):
-            multiplier *= 1.55
+            multiplier *= 1.05
         if candidate["score"] in {"4-2", "2-4"}:
             if over25 >= 0.68 and btts >= 0.58 and 0.50 <= favorite_prob <= 0.70:
-                multiplier *= 2.25
+                multiplier *= 1.08
             else:
-                multiplier *= 0.45
+                multiplier *= 0.88
 
         candidate["coverageProb"] = candidate["prob"] * multiplier
         adjusted.append(candidate)
     return sorted(adjusted, key=lambda item: item["coverageProb"], reverse=True)
 
 
-def build_coverage_scores(
+def build_legacy_coverage_scores(
     all_scores: list[dict[str, Any]],
     home_win: float,
     draw: float,
@@ -1719,6 +1728,146 @@ def build_coverage_scores(
     }
 
 
+def build_coverage_scores(
+    all_scores: list[dict[str, Any]],
+    home_win: float,
+    draw: float,
+    away_win: float,
+    market_signal: dict[str, Any] | None = None,
+    params: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    """Build a compact, diversified final-stage score set.
+
+    The old recommendation engine contained many hand-picked score branches.
+    This version starts from the calibrated score distribution and adds only
+    distinct match-state protection: adjacent result, draw/reversal, clean
+    sheet, and a high-scoring tail when the distribution supports it.
+    """
+    params = params or FINAL_STAGE_MODEL_PARAMS
+    ranked = sorted(all_scores, key=lambda item: item["prob"], reverse=True)
+    favorite = "home" if home_win >= away_win else "away"
+    favorite_prob = max(home_win, away_win)
+    favorite_margin = abs(home_win - away_win)
+    over25 = sum(item["prob"] for item in all_scores if item["home"] + item["away"] >= 3)
+    btts = sum(item["prob"] for item in all_scores if item["home"] > 0 and item["away"] > 0)
+    coverage_ranked = apply_historical_prior(ranked, favorite, favorite_prob, draw, over25, btts, params)
+
+    used: set[str] = set()
+
+    def choose(predicate, label: str) -> dict[str, Any] | None:
+        for item in coverage_ranked:
+            if item["score"] not in used and predicate(item):
+                chosen = dict(item)
+                chosen["label"] = label
+                used.add(chosen["score"])
+                return chosen
+        return None
+
+    def append(items: list[dict[str, Any]], candidate: dict[str, Any] | None, limit: int) -> None:
+        if candidate and len(items) < limit:
+            items.append(candidate)
+
+    top3: list[dict[str, Any]] = []
+    first = dict(ranked[0])
+    first["label"] = "模型与赔率综合首选"
+    used.add(first["score"])
+    top3.append(first)
+
+    # Same-direction neighbouring score: keeps the main judgement intact while
+    # covering a one-goal swing instead of forcing a speculative large score.
+    if favorite == "home":
+        append(top3, choose(lambda x: x["home"] > x["away"] and x["home"] - x["away"] == 1, "主队一球胜保护"), 3)
+    else:
+        append(top3, choose(lambda x: x["away"] > x["home"] and x["away"] - x["home"] == 1, "客队一球胜保护"), 3)
+
+    # The third position protects the alternate match state.  Strong favourites
+    # protect a draw; closer games protect the best opposite-direction outcome.
+    if favorite_prob >= 0.58 and favorite_margin >= 0.20:
+        append(top3, choose(lambda x: x["home"] == x["away"], "平局保护"), 3)
+    elif favorite == "home":
+        append(top3, choose(lambda x: x["away"] > x["home"], "客胜保护"), 3)
+    else:
+        append(top3, choose(lambda x: x["home"] > x["away"], "主胜保护"), 3)
+    for item in coverage_ranked:
+        if len(top3) >= 3:
+            break
+        if item["score"] not in used:
+            used.add(item["score"])
+            top3.append(dict(item, label="概率补位"))
+
+    top5 = [dict(item) for item in top3]
+    top5_used = {item["score"] for item in top5}
+
+    def add_top5(predicate, label: str) -> None:
+        for item in coverage_ranked:
+            if len(top5) >= 5:
+                return
+            if item["score"] not in top5_used and predicate(item):
+                top5_used.add(item["score"])
+                top5.append(dict(item, label=label))
+                return
+
+    if favorite_prob >= 0.54 and over25 >= 0.40:
+        if favorite == "home":
+            add_top5(lambda x: x["home"] >= 3 and x["away"] == 0, "优势方大胜零封保护")
+        else:
+            add_top5(lambda x: x["away"] >= 3 and x["home"] == 0, "优势方大胜零封保护")
+    if favorite_prob >= 0.44:
+        if favorite == "home":
+            add_top5(lambda x: x["home"] > x["away"] and x["away"] == 0, "优势方零封保护")
+        else:
+            add_top5(lambda x: x["away"] > x["home"] and x["home"] == 0, "优势方零封保护")
+    if btts >= 0.44 and over25 >= 0.35:
+        if favorite == "home":
+            add_top5(lambda x: x["home"] > x["away"] and x["away"] > 0, "优势方双方进球保护")
+        else:
+            add_top5(lambda x: x["away"] > x["home"] and x["home"] > 0, "优势方双方进球保护")
+    if draw >= 0.25:
+        add_top5(lambda x: x["home"] == x["away"], "平局补位")
+    if over25 >= 0.56 and btts >= 0.50:
+        add_top5(lambda x: x["home"] > 0 and x["away"] > 0 and x["home"] + x["away"] >= 4, "高比分尾部保护")
+    for item in coverage_ranked:
+        if len(top5) >= 5:
+            break
+        if item["score"] not in top5_used:
+            top5_used.add(item["score"])
+            top5.append(dict(item, label="概率补位"))
+
+    top10 = [dict(item) for item in top5]
+    top10_used = {item["score"] for item in top10}
+    for item in coverage_ranked:
+        if len(top10) >= 10:
+            break
+        if item["score"] not in top10_used:
+            top10_used.add(item["score"])
+            top10.append(dict(item, label="90%候选"))
+
+    upset_scores = [
+        dict(item, label="冷门保护")
+        for item in ranked
+        if (item["away"] > item["home"] if favorite == "home" else item["home"] > item["away"])
+    ][:3]
+    if favorite_prob >= 0.58 and favorite_margin >= 0.20:
+        confidence, confidence_note = "高", "胜负方向较清晰；三选以主方向、相邻比分和平局保护组成。"
+    elif favorite_prob >= 0.45 or draw >= 0.28:
+        confidence, confidence_note = "中", "比赛存在明确倾向，但一球差与平局仍需通过五选覆盖。"
+    else:
+        confidence, confidence_note = "低", "三种赛果接近，建议不要只使用主推三选。"
+
+    return {
+        "recommendedTop3": top3,
+        "recommendedTop5": top5,
+        "candidateTop10": top10,
+        "upsetProtection": upset_scores,
+        "top3ProbabilityMass": sum(item["prob"] for item in top3),
+        "top5ProbabilityMass": sum(item["prob"] for item in top5),
+        "top10ProbabilityMass": sum(item["prob"] for item in top10),
+        "confidence": confidence,
+        "confidenceNote": confidence_note,
+        "coverageAdvice": "最终阶段采用固定参数；开赛前的胜平负和正确比分赔率会优先校准本场。",
+    }
+
+
 def news_adjustment(news: dict[str, Any]) -> tuple[float, float]:
     quality = news.get("signalQuality", 0.0) if news.get("ok") else 0.0
     if quality < 0.34:
@@ -1768,7 +1917,7 @@ def predict(home: str, away: str, neutral: bool, use_web: bool = True) -> dict[s
         valid = "、".join(team["zh"] for team in KNOCKOUT_TEAMS)
         raise ValueError(f"只能选择本届世界杯32强淘汰赛球队。可选：{valid}")
     home_news, away_news, market_signal = collect_live_signals(home_profile, away_profile, use_web)
-    params = model_params()
+    params = final_stage_model_params()
     home_news_form, home_news_risk = news_adjustment(home_news)
     away_news_form, away_news_risk = news_adjustment(away_news)
 
@@ -1854,7 +2003,7 @@ def predict(home: str, away: str, neutral: bool, use_web: bool = True) -> dict[s
         "dataQuality": {
             "score": round(data_points / 5 * 100),
             "level": "高" if data_points >= 4 else "中",
-            "note": "预测口径为90分钟常规时间，不含加时赛和点球；竞彩赔率命中时会作为市场先验参与校准。",
+            "note": "预测口径为90分钟常规时间，不含加时赛和点球；最终阶段固定参数，竞彩胜平负和正确比分赔率优先参与本场校准。",
             "searchQuality": search_quality,
             "searchNote": "搜索摘要命中球队名称时才会参与模型修正；泛化新闻会被降权。",
         },
@@ -1870,6 +2019,12 @@ def predict(home: str, away: str, neutral: bool, use_web: bool = True) -> dict[s
                 "DuckDuckGo HTML 搜索摘要",
                 "中国体育彩票胜平负公开赔率",
             ],
+        },
+        "modelProfile": {
+            "name": "最终阶段市场校准模型",
+            "marketWeight": "临场赔率主导",
+            "historyWeight": "弱历史先验",
+            "learning": "赛后即时回测，参数冻结，避免单场结果过拟合",
         },
         "generatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
         "model": {
@@ -2080,7 +2235,8 @@ def api_results_status():
             "ok": True,
             "matches": len(results),
             "sample": results[-8:],
-            "modelParams": model_params(),
+            "modelParams": final_stage_model_params(),
+            "modelProfile": "最终阶段市场校准模型（赛后回测，参数冻结）",
             "refresh": refresh,
         }
     )

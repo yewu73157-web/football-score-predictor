@@ -127,7 +127,7 @@ function renderSources(data) {
     : trend.reason || "暂无明显赔率趋势";
   const params = data.model && data.model.params ? data.model.params : {};
   const paramsText = Object.keys(params).length
-    ? `比分市场${fixedParam(params, "score_market_strength", 0.24)}，胜平负市场${fixedParam(params, "market_outcome_strength", 0.38)}，2-0偏置${fixedParam(params, "two_zero_bias")}，3-0偏置${fixedParam(params, "three_zero_bias")}，1-1偏置${fixedParam(params, "one_one_bias")}`
+    ? `正确比分赔率权重 ${fixedParam(params, "score_market_strength", 0.42)}，胜平负赔率权重 ${fixedParam(params, "market_outcome_strength", 0.58)}；赛后结果只进入回测，不会因为单场结果自动追涨杀跌。`
     : "暂无模型参数";
   const scoreOddsText = Object.keys(scoreOdds).length
     ? Object.entries(scoreOdds)
@@ -145,7 +145,7 @@ function renderSources(data) {
     </div>
     <div class="source-card">
       <strong>模型因子</strong>
-      <p>使用国家队基础强度、本届赛事状态、东道主优势、淘汰赛保守系数、历史淘汰赛比分先验、90分钟常规时间校准、是否同洲际对手、竞彩胜平负赔率、联网搜索中的近况和伤停关键词来修正预期进球。</p>
+      <p>最终阶段以开赛前的胜平负与正确比分赔率为主，本届状态、国家队强度、首发伤停和90分钟淘汰赛历史仅作辅助校准。赛后结果即时计入回测，但不会用单场赛果改写剩余比赛的核心参数。</p>
       <p>预测口径：${data.timeScope || "90分钟常规时间，不含加时赛和点球大战"}。</p>
       <p>搜索质量：${pct(data.dataQuality.searchQuality || 0)}。${data.dataQuality.searchNote || ""}</p>
     </div>
@@ -155,7 +155,7 @@ function renderSources(data) {
       <p>赔率趋势：${hotTrendText}</p>
     </div>
     <div class="source-card">
-      <strong>自动学习参数</strong>
+      <strong>最终阶段模型</strong>
       <p>${paramsText}</p>
       <p>版本：${data.model && data.model.version ? data.model.version : "-"}</p>
     </div>
